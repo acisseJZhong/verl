@@ -24,7 +24,7 @@ from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import get_generation_config, update_model_config
 
-__all__ = ["HFModelConfig", "MtpConfig"]
+__all__ = ["HFModelConfig", "MtpConfig", "TorchtitanModelConfig"]
 
 
 @dataclass
@@ -217,6 +217,46 @@ class HFModelConfig(BaseConfig):
                         raise TypeError(
                             f"All elements in target_modules list must be strings, but found {type(x).__name__}"
                         )
+
+    def get_processor(self):
+        return self.processor if self.processor is not None else self.tokenizer
+
+
+@dataclass
+class TorchtitanModelConfig(BaseConfig):
+    _mutable_fields = {
+        "tokenizer",
+        "processor",
+        "hf_config",
+        "local_hf_assets_path",
+    }
+
+    name: str = "qwen3"
+    flavor: str = "0.6B"
+    hf_assets_path: str = "./assets/hf/Qwen3-0.6B"
+    local_hf_assets_path: Optional[str] = None
+
+    hf_config: Any = None
+    tokenizer: Any = None
+    processor: Any = None
+
+    # whether to use shared memory
+    use_shm: bool = False
+    trust_remote_code: bool = False
+
+    use_remove_padding: bool = True
+
+    def __post_init__(self):
+        self.local_hf_assets_path = copy_to_local(self.hf_assets_path, use_shm=self.use_shm)
+
+        # Load tokenizer from hf_assets_path
+        self.tokenizer = hf_tokenizer(self.local_hf_assets_path, trust_remote_code=self.trust_remote_code)
+        self.processor = hf_processor(self.local_hf_assets_path, trust_remote_code=self.trust_remote_code)
+
+        # Load hf_config for model architecture info
+        self.hf_config = AutoConfig.from_pretrained(
+            self.local_hf_assets_path, trust_remote_code=self.trust_remote_code
+        )
 
     def get_processor(self):
         return self.processor if self.processor is not None else self.tokenizer

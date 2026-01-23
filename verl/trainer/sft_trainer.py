@@ -395,7 +395,6 @@ class SFTTrainer:
 
 def run_sft(config):
     from verl.utils.distributed import initialize_global_process_group
-
     initialize_global_process_group()
     trainer = SFTTrainer(config=config)
     trainer.fit()
