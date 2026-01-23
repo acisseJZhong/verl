@@ -76,7 +76,7 @@ class TrainingWorker(Worker):
         # DistProfilerExtension.__init__(
         #     self, DistProfiler(rank=self.rank, config=self.profiler_config, tool_config=tool_config)
         # )
-
+        print(f"jessica: {self.config.model_type=} and {self.engine_config.strategy=} and {self.config=}")
         self.engine: BaseEngine = EngineRegistry.new(
             model_type=self.config.model_type,
             backend=self.engine_config.strategy,

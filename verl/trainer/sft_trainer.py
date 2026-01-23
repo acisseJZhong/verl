@@ -311,7 +311,7 @@ class SFTTrainer:
 
                     # TODO: we can actual accumulate metrics for N steps and perform aggregate metrics
                     metrics["train/loss"] = metrics.pop("loss")
-                    metrics["train/grad_norm"] = metrics.pop("grad_norm")
+                    # metrics["train/grad_norm"] = metrics.pop("grad_norm")
                     metrics["train/lr"] = metrics.pop("lr")
                     metrics["train/mfu"] = metrics.pop("mfu")
                     metrics["train/global_tokens"] = torch.sum(
@@ -364,7 +364,6 @@ class SFTTrainer:
 
 def run_sft(config):
     from verl.utils.distributed import initialize_global_process_group
-
     initialize_global_process_group()
     trainer = SFTTrainer(config=config)
     trainer.fit()

@@ -22,6 +22,16 @@ __all__ = [
 ]
 
 try:
+    from .torchtitan import TorchTitanEngine, TorchTitanEngineWithLMHead
+
+    __all__ += ["TorchTitanEngine", "TorchTitanEngineWithLMHead"]
+except ImportError as e:
+    import warnings
+    warnings.warn(f"Failed to import torchtitan engine: {e}")
+    TorchTitanEngine = None
+    TorchTitanEngineWithLMHead = None
+
+try:
     from .veomni import VeOmniEngine, VeOmniEngineWithLMHead
 
     __all__ += ["VeOmniEngine", "VeOmniEngineWithLMHead"]

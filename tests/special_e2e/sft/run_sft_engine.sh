@@ -25,7 +25,7 @@ RESUME_MODE=disable
 
 ckpts_home=${ckpts_home:-~/verl/test/gsm8k-sft-${backend}}
 
-MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-0.5B}
+MODEL_ID=${MODEL_ID:-Qwen/Qwen3-0.6B}
 MODEL_PATH=${MODEL_PATH:-${HOME}/models/${MODEL_ID}}
 #huggingface-cli download "${MODEL_ID}" --local-dir "${MODEL_PATH}"
 
@@ -54,7 +54,10 @@ FSDP_ENGINE_CONFIG="\
     optim.lr_scheduler_type=cosine \
     engine.ulysses_sequence_parallel_size=${SP_SIZE} \
     engine.strategy=${FSDP_STRATEGY} \
-    engine.fsdp_size=${FSDP_SIZE}"
+    engine.fsdp_size=${FSDP_SIZE} \
+    engine.use_torch_compile=False \
+    model=hf_model \
+    model.path=${MODEL_PATH}"
 
 VEOMNI_ENGINE_CONFIG="\
     engine=${backend} \
@@ -88,6 +91,23 @@ MEGATRON_ENGINE_CONFIG="\
     engine.context_parallel_size=${CP_SIZE}
     engine.use_mbridge=True"
 
+TORCHTITAN_ENGINE_CONFIG="\
+    model=torchtitan_model \
+    model.hf_assets_path=${MODEL_PATH} \
+    engine=${backend} \
+    optim=${backend} \
+    optim.lr=1e-5 \
+    optim.lr_warmup_steps_ratio=0.2 \
+    optim.weight_decay=0.1 \
+    optim.betas="[0.9,0.95]" \
+    optim.clip_grad=1.0 \
+    optim.min_lr_factor=0.1 \
+    engine.tensor_parallel_size=${TP_SIZE} \
+    engine.pipeline_parallel_size=${PP_SIZE} \
+    engine.context_parallel_size=${CP_SIZE} \
+    engine.data_parallel_size=${FSDP_SIZE}"
+
+
 if [ "$backend" = "fsdp" ]; then
     ENGINE_CONFIG="$FSDP_ENGINE_CONFIG"
     echo "Using fsdp engine"
@@ -96,6 +116,10 @@ elif [ "$backend" = "veomni" ]; then
     ENGINE_CONFIG="$VEOMNI_ENGINE_CONFIG"
     echo "Using veomni engine"
     exp_name=gsm8k-${backend}-sp${SP_SIZE}-fsdp${FSDP_SIZE}-pad-${PAD_MODE}-use_remove_padding-${USE_REMOVE_PADDING}-mode-${mode}
+elif [ "$backend" = "torchtitan" ]; then
+    ENGINE_CONFIG="$TORCHTITAN_ENGINE_CONFIG"
+    echo "Using torchtitan engine"
+    exp_name=gsm8k-${backend}-tp${TP_SIZE}-pp${PP_SIZE}-cp${CP_SIZE}-dp${FSDP_SIZE}-pad-${PAD_MODE}-use_remove_padding-${USE_REMOVE_PADDING}-mode-${mode}
 else
     ENGINE_CONFIG="$MEGATRON_ENGINE_CONFIG"
     echo "Using megatron engine"
@@ -113,8 +137,7 @@ $COMMAND \
     data.use_dynamic_bsz=True \
     data.max_token_len_per_gpu=2048 \
     data.messages_key=messages \
-    model.path=$MODEL_PATH \
-    model.use_remove_padding=${USE_REMOVE_PADDING} \
+    data.ignore_input_ids_mismatch=True \
     ${ENGINE_CONFIG} \
     trainer.test_freq=after_each_epoch \
     trainer.save_freq=-1 \
@@ -122,12 +145,12 @@ $COMMAND \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.total_epochs=2 \
-    trainer.total_training_steps=2 \
+    trainer.total_training_steps=1000 \
     trainer.default_local_dir="${ckpts_home}" \
     trainer.resume_mode=${RESUME_MODE} \
+    # +model.override_config.attn_implementation=sdpa \
 
     # trainer.total_training_steps=${TOTAL_TRAIN_STEP} \
     # trainer.checkpoint.save_contents=[model,optimizer,extra,hf_model] \
     # trainer.max_ckpt_to_keep=1 \
-    
 rm -rf "${ckpts_home:?}/*"
