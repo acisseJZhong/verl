@@ -89,6 +89,9 @@ class HFModelConfig(BaseConfig):
     lora_adapter_path: Optional[str] = None
     use_liger: bool = False
 
+    use_fused_kernels: bool = False
+    fused_kernel_options: dict = field(default_factory=dict)
+
     architectures: Optional[list[str]] = None
 
     def __post_init__(self):
