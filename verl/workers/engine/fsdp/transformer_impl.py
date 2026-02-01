@@ -513,6 +513,10 @@ class FSDPEngine(BaseEngine):
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )
 
+        # DEBUG: Print key values for loss comparison
+        if torch.distributed.get_rank() == 0:
+            print(f"DEBUG FSDP: num_micro_batches={len(micro_batches)}, batch_num_tokens={batch_num_tokens.item()}, dp_size={self.get_data_parallel_size()}")
+
         output_lst = []
 
         ctx = torch.no_grad() if forward_only else nullcontext()
@@ -924,6 +928,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     inplace_backward=inplace_backward,
                 )
 
+                # DEBUG: Compare log_probs statistics
+                if torch.distributed.get_rank() == 0:
+                    print(f"DEBUG FSDP: input_ids_rmpad_rolled shape={input_ids_rmpad_rolled.shape}, min={input_ids_rmpad_rolled.min().item():.4f}, max={input_ids_rmpad_rolled.max().item(): .4f}, mean={input_ids_rmpad_rolled.float().mean().item():.4f}")
+                    print(f"DEBUG FSDP: logits_rmpad shape={logits_rmpad.shape}, min={logits_rmpad.min().item():.4f}, max={logits_rmpad.max().item():.4f}, mean={logits_rmpad.mean().item():.4f}")
+                    print(f"DEBUG FSDP: log_probs shape={log_probs.shape}, min={log_probs.min().item():.4f}, max={log_probs.max().item():.4f}, mean={log_probs.mean().item():.4f}")
                 # compute entropy
                 if calculate_entropy:
                     if not self.engine_config.entropy_checkpointing:
@@ -1026,6 +1035,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 assert forward_only, "forward_only must be True when loss_function is None"
                 loss = torch.tensor(1.0, device=device_name)
                 metrics = {}
+            print(f"jessica: {loss=}")
+            exit()
 
             output = {
                 "model_output": model_output,

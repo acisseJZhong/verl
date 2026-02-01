@@ -42,23 +42,6 @@ PAD_MODE=${PAD_MODE:-no_padding}
 
 USE_REMOVE_PADDING=${USE_REMOVE_PADDING:-True}
 
-FSDP_ENGINE_CONFIG="\
-    engine=${backend} \
-    optim=${backend} \
-    optim.lr=1e-5 \
-    optim.lr_warmup_steps_ratio=0.2 \
-    optim.weight_decay=0.1 \
-    optim.betas="[0.9,0.95]" \
-    optim.clip_grad=1.0 \
-    optim.min_lr_ratio=0.1 \
-    optim.lr_scheduler_type=cosine \
-    engine.ulysses_sequence_parallel_size=${SP_SIZE} \
-    engine.strategy=${FSDP_STRATEGY} \
-    engine.fsdp_size=${FSDP_SIZE} \
-    engine.use_torch_compile=False \
-    model=hf_model \
-    model.path=${MODEL_PATH}"
-
 VEOMNI_ENGINE_CONFIG="\
     engine=${backend} \
     optim=${backend} \
@@ -90,9 +73,25 @@ MEGATRON_ENGINE_CONFIG="\
     +engine.override_transformer_config.context_parallel_size=${CP_SIZE} \
     engine.use_mbridge=True"
 
+FSDP_ENGINE_CONFIG="\
+    engine=${backend} \
+    optim=${backend} \
+    optim.lr=1e-5 \
+    optim.lr_warmup_steps_ratio=0.2 \
+    optim.weight_decay=0.1 \
+    optim.betas="[0.9,0.95]" \
+    optim.clip_grad=1.0 \
+    optim.min_lr_ratio=0.1 \
+    optim.lr_scheduler_type=cosine \
+    engine.ulysses_sequence_parallel_size=${SP_SIZE} \
+    engine.strategy=${FSDP_STRATEGY} \
+    engine.fsdp_size=${FSDP_SIZE} \
+    engine.use_torch_compile=False \
+    model=hf_model \
+    model.path=${MODEL_PATH} \
+    +model.override_config.attn_implementation=sdpa"
+
 TORCHTITAN_ENGINE_CONFIG="\
-    model=torchtitan_model \
-    model.hf_assets_path=${MODEL_PATH} \
     engine=${backend} \
     optim=${backend} \
     optim.lr=1e-5 \
@@ -104,7 +103,10 @@ TORCHTITAN_ENGINE_CONFIG="\
     engine.tensor_parallel_size=${TP_SIZE} \
     engine.pipeline_parallel_size=${PP_SIZE} \
     engine.context_parallel_size=${CP_SIZE} \
-    engine.data_parallel_size=${FSDP_SIZE}"
+    engine.data_parallel_size=${FSDP_SIZE} \
+    engine.use_torch_compile=False \
+    model=torchtitan_model \
+    model.hf_assets_path=${MODEL_PATH}"
 
 
 if [ "$backend" = "fsdp" ]; then
@@ -147,7 +149,6 @@ $COMMAND \
     trainer.total_training_steps=1000 \
     trainer.default_local_dir="${ckpts_home}" \
     trainer.resume_mode=${RESUME_MODE} \
-    # +model.override_config.attn_implementation=sdpa \
 
     # trainer.total_training_steps=${TOTAL_TRAIN_STEP} \
     # trainer.checkpoint.save_contents=[model,optimizer,extra,hf_model] \
