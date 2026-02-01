@@ -25,8 +25,9 @@ from typing import Callable, Optional
 import torch
 import torch.distributed
 from tensordict import TensorDict
-from torchtitan.config.job_config import (Compile, JobConfig, LRScheduler,
-                                          Model, Optimizer, Parallelism)
+from torchtitan.config.job_config import (Checkpoint, Compile, JobConfig,
+                                          LRScheduler, Model, Optimizer,
+                                          Parallelism)
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.train import Trainer
@@ -134,7 +135,12 @@ class TorchTitanEngine(BaseEngine):
             expert_parallel_degree=engine_config.expert_parallel_size,
             expert_tensor_parallel_degree=engine_config.expert_tensor_parallel_size,
         )
-        self.checkpoint_config = checkpoint_config
+        self.checkpoint_config = Checkpoint(
+            enable=True,
+            initial_load_in_hf=True,
+            initial_load_model_only=True,
+            initial_load_path=model_config.hf_assets_path,
+        )
         self.compile_config = Compile(enable=engine_config.use_torch_compile)
 
         # Construct Torchtitan's JobConfig
@@ -143,7 +149,7 @@ class TorchTitanEngine(BaseEngine):
             optimizer=self.optimizer_config,
             lr_scheduler=self.lr_scheduler_config,
             parallelism=self.parallelism_config,
-            # checkpoint=self.checkpoint_config,
+            checkpoint=self.checkpoint_config,
             compile=self.compile_config,
         )
         self.trainer = Trainer(self.config)
@@ -204,6 +210,8 @@ class TorchTitanEngine(BaseEngine):
         """
         self.module = self.trainer.model_parts
         self.checkpointer = self.trainer.checkpointer
+        self.checkpointer.load()
+
         if not self.engine_config.forward_only:
             self.optimizer = self.trainer.optimizers
             self.lr_scheduler = self.trainer.lr_schedulers
@@ -280,6 +288,10 @@ class TorchTitanEngine(BaseEngine):
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )
 
+        # DEBUG: Print key values for loss comparison
+        if torch.distributed.get_rank() == 0:
+            print(f"DEBUG TorchTitan: num_micro_batches={len(micro_batches)}, batch_num_tokens={batch_num_tokens.item()}, dp_size={self.get_data_parallel_size()}")
+
         output_lst = []
 
         ctx = torch.no_grad() if forward_only else nullcontext()
@@ -289,8 +301,8 @@ class TorchTitanEngine(BaseEngine):
                 loss, output = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
                 # TODO(jessicazhong): enable forward only in Torchtitan
                 print(f"{torch.distributed.get_rank()=} {loss=} {self.is_mp_src_rank_with_outputs()=}")
-                # if not forward_only:
-                #     loss.backward()
+                if not forward_only:
+                    loss.backward()
             output_lst.append(output)
 
         # Only the rank with outputs (last PP stage, first TP/CP rank) processes results
@@ -459,6 +471,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
             input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)
+            # input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)
             output_args["input_ids_rmpad_rolled"] = input_ids_rmpad_rolled
 
             model_inputs = {
@@ -518,7 +531,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
 
         input_ids = micro_batch["input_ids"]
         if use_remove_padding:
-            input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
+            input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"].squeeze(0)
             logits_rmpad = logits.squeeze(0)
             logits_rmpad.div_(temperature)
 
@@ -527,11 +540,16 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 inplace_backward = False
             # logits_rmpad torch.Size([1912, 151936]), input_ids_rmpad_rolled torch.Size([1, 1912])
             log_probs = logprobs_from_logits(
-                logits=logits_rmpad.unsqueeze(0),
+                logits=logits_rmpad,
                 labels=input_ids_rmpad_rolled,
                 inplace_backward=inplace_backward,
             )
 
+            # DEBUG: Compare log_probs statistics
+            if torch.distributed.get_rank() == 0:
+                print(f"DEBUG TorchTitan: input_ids_rmpad_rolled shape={input_ids_rmpad_rolled.shape}, min={input_ids_rmpad_rolled.min().item():.4f}, max={input_ids_rmpad_rolled.max().item(): .4f}, mean={input_ids_rmpad_rolled.float().mean().item():.4f}")
+                print(f"DEBUG TorchTitan: logits_rmpad shape={logits_rmpad.shape}, min={logits_rmpad.min().item():.4f}, max={logits_rmpad.max().item():.4f}, mean={logits_rmpad.mean().item():.4f}")
+                print(f"DEBUG TorchTitan: log_probs shape={log_probs.shape}, min={log_probs.min().item():.4f}, max={log_probs.max().item():.4f}, mean={log_probs.mean().item():.4f}")
             if calculate_entropy:
                 if not self.engine_config.entropy_checkpointing:
                     entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)
@@ -609,7 +627,8 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 "attention_masks": model_inputs["attention_mask"],
             }
 
-            _, logits = self.trainer.forward_backward_step(input_dict=input_dict, labels=output_args["input_ids_rmpad_rolled"], global_valid_tokens=torch.tensor(1.0, device=device_name), return_outputs=True)
+            # _, logits = self.trainer.forward_backward_step(input_dict=input_dict, labels=output_args["input_ids_rmpad_rolled"], global_valid_tokens=torch.tensor(1.0, device=device_name), return_outputs=True)
+            _, logits = self.trainer.forward_backward_step(input_dict=input_dict, labels=output_args["input_ids_rmpad_rolled"])
 
             if self.is_mp_src_rank_with_outputs():
                 model_output: dict[str, Unknown] = self.prepare_model_outputs(
@@ -623,7 +642,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 else:
                     assert forward_only, "forward_only must be True when loss_function is None"
                     loss = torch.tensor(1.0, device=device_name)
-                    metrics = {}
+                    metrics: dict[Unknown, Unknown] = {}
                 print(f"jessica: {loss=}")
 
                 output = {
