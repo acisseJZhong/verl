@@ -24,44 +24,30 @@ from typing import Callable, Optional
 
 import torch
 import torch.distributed
-import verl.utils.torch_functional as verl_F
 from tensordict import TensorDict
-from torchtitan.config.job_config import (
-    Compile,
-    JobConfig,
-    LRScheduler,
-    Model,
-    Optimizer,
-    Parallelism,
-)
+from torchtitan.config.job_config import (Compile, JobConfig, LRScheduler,
+                                          Model, Optimizer, Parallelism)
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.train import Trainer
+
+import verl.utils.torch_functional as verl_F
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.device import get_device_id, get_device_name
-from verl.utils.fsdp_utils import (
-    load_fsdp_model_to_gpu,
-    load_fsdp_optimizer,
-    offload_fsdp_model_to_cpu,
-    offload_fsdp_optimizer,
-)
+from verl.utils.fsdp_utils import (load_fsdp_model_to_gpu, load_fsdp_optimizer,
+                                   offload_fsdp_model_to_cpu,
+                                   offload_fsdp_optimizer)
 from verl.utils.model import extract_multi_modal_inputs
 from verl.utils.torch_functional import logprobs_from_logits
-from verl.workers.config import (
-    TorchtitanEngineConfig,
-    TorchtitanModelConfig,
-    TorchtitanOptimizerConfig,
-)
+from verl.workers.config import (TorchtitanEngineConfig, TorchtitanModelConfig,
+                                 TorchtitanOptimizerConfig)
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
-from ..utils import (
-    enable_full_determinism,
-    postprocess_batch_func,
-    prepare_micro_batches,
-)
+from ..utils import (enable_full_determinism, postprocess_batch_func,
+                     prepare_micro_batches)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -278,7 +264,7 @@ class TorchTitanEngine(BaseEngine):
             return None
         return mesh
 
-    def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
+    def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False):
         """Perform forward and optionally backward pass on a batch."""
         tu.assign_non_tensor(data, sp_size=self.engine_config.tensor_parallel_size)
 
@@ -301,13 +287,17 @@ class TorchTitanEngine(BaseEngine):
         for micro_batch in micro_batches:
             with ctx:
                 loss, output = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
-
                 # TODO(jessicazhong): enable forward only in Torchtitan
+                print(f"{torch.distributed.get_rank()=} {loss=} {self.is_mp_src_rank_with_outputs()=}")
                 # if not forward_only:
                 #     loss.backward()
             output_lst.append(output)
 
-        return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+        # Only the rank with outputs (last PP stage, first TP/CP rank) processes results
+        if self.is_mp_src_rank_with_outputs():
+            return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+        else:
+            return {}
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         raise NotImplementedError("forward_step must be implemented in subclass")
@@ -619,25 +609,29 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 "attention_masks": model_inputs["attention_mask"],
             }
 
-            loss, logits = self.trainer.forward_backward_step(input_dict=input_dict, labels=output_args["input_ids_rmpad_rolled"])
+            _, logits = self.trainer.forward_backward_step(input_dict=input_dict, labels=output_args["input_ids_rmpad_rolled"], global_valid_tokens=torch.tensor(1.0, device=device_name), return_outputs=True)
 
-            model_output: dict[str, Unknown] = self.prepare_model_outputs(
-                logits=logits, output_args=output_args, micro_batch=micro_batch
-            )
-
-            if loss_function is not None:
-                loss, metrics = loss_function(
-                    model_output=model_output, data=micro_batch, dp_group=self.get_data_parallel_group()
+            if self.is_mp_src_rank_with_outputs():
+                model_output: dict[str, Unknown] = self.prepare_model_outputs(
+                    logits=logits, output_args=output_args, micro_batch=micro_batch
                 )
+
+                if loss_function is not None:
+                    loss, metrics = loss_function(
+                        model_output=model_output, data=micro_batch, dp_group=self.get_data_parallel_group()
+                    )
+                else:
+                    assert forward_only, "forward_only must be True when loss_function is None"
+                    loss = torch.tensor(1.0, device=device_name)
+                    metrics = {}
+                print(f"jessica: {loss=}")
+
+                output = {
+                    "model_output": model_output,
+                    "loss": loss.detach().item(),
+                    "metrics": metrics,
+                }
+
+                return loss, output
             else:
-                assert forward_only, "forward_only must be True when loss_function is None"
-                loss = torch.tensor(1.0, device=device_name)
-                metrics = {}
-
-            output = {
-                "model_output": model_output,
-                "loss": loss.detach().item(),
-                "metrics": metrics,
-            }
-
-            return loss, output
+                return None, {}
