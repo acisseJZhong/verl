@@ -27,7 +27,7 @@ import torch.distributed
 from tensordict import TensorDict
 from torchtitan.config.job_config import (Checkpoint, Compile, JobConfig,
                                           LRScheduler, Model, Optimizer,
-                                          Parallelism)
+                                          Parallelism, Training)
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.train import Trainer
@@ -118,10 +118,24 @@ class TorchTitanEngine(BaseEngine):
             name=model_config.name, flavor=model_config.flavor, hf_assets_path=model_config.hf_assets_path
         )
         self.engine_config = engine_config
-        self.optimizer_config = Optimizer(name=optimizer_config.name, lr=optimizer_config.lr, eps=optimizer_config.eps)
+
+        total_steps = optimizer_config.total_training_steps
+        lr_warmup_steps = optimizer_config.lr_warmup_steps
+        if lr_warmup_steps is None or lr_warmup_steps <= 0:
+            lr_warmup_steps = int(optimizer_config.lr_warmup_steps_ratio * total_steps)
+
+        self.optimizer_config = Optimizer(
+            name=optimizer_config.name,
+            lr=optimizer_config.lr,
+            eps=optimizer_config.eps,
+            beta1=optimizer_config.betas[0],
+            beta2=optimizer_config.betas[1],
+            weight_decay=optimizer_config.weight_decay,
+            implementation="foreach",  # Match FSDP's default optimizer behavior
+        )
         self.lr_scheduler_config = LRScheduler(
-            warmup_steps=optimizer_config.lr_warmup_steps,
-            decay_ratio=optimizer_config.weight_decay,
+            warmup_steps=lr_warmup_steps,
+            decay_ratio=None,  # None means decay starts immediately after warmup
             decay_type=optimizer_config.decay_type,
             min_lr_factor=optimizer_config.min_lr_factor,
         )
@@ -142,6 +156,11 @@ class TorchTitanEngine(BaseEngine):
             initial_load_path=model_config.hf_assets_path,
         )
         self.compile_config = Compile(enable=engine_config.use_torch_compile)
+        self.training_config = Training(
+            dtype="float32",  # Match FSDP's bfloat16 weights
+            mixed_precision_param="bfloat16",
+            mixed_precision_reduce="float32",
+        )
 
         # Construct Torchtitan's JobConfig
         self.config = JobConfig(
@@ -151,6 +170,7 @@ class TorchTitanEngine(BaseEngine):
             parallelism=self.parallelism_config,
             checkpoint=self.checkpoint_config,
             compile=self.compile_config,
+            training=self.training_config,
         )
         self.trainer = Trainer(self.config)
 
@@ -288,10 +308,6 @@ class TorchTitanEngine(BaseEngine):
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )
 
-        # DEBUG: Print key values for loss comparison
-        if torch.distributed.get_rank() == 0:
-            print(f"DEBUG TorchTitan: num_micro_batches={len(micro_batches)}, batch_num_tokens={batch_num_tokens.item()}, dp_size={self.get_data_parallel_size()}")
-
         output_lst = []
 
         ctx = torch.no_grad() if forward_only else nullcontext()
@@ -300,7 +316,7 @@ class TorchTitanEngine(BaseEngine):
             with ctx:
                 loss, output = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
                 # TODO(jessicazhong): enable forward only in Torchtitan
-                print(f"{torch.distributed.get_rank()=} {loss=} {self.is_mp_src_rank_with_outputs()=}")
+                print(f"DEBUG TorchTitan: {torch.distributed.get_rank()=} {loss=} {self.is_mp_src_rank_with_outputs()=}")
                 if not forward_only:
                     loss.backward()
             output_lst.append(output)
@@ -316,18 +332,25 @@ class TorchTitanEngine(BaseEngine):
 
     def optimizer_zero_grad(self):
         """Zero gradients."""
-        dist_utils.clip_grad_norm_(
+        self.optimizer.zero_grad()
+
+    def optimizer_step(self):
+        """Perform optimizer step with gradient clipping."""
+        grad_norm = dist_utils.clip_grad_norm_(
             [p for m in self.module for p in m.parameters()],
             self.config.training.max_norm,
             foreach=True,
             pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
             ep_enabled=self.parallel_dims.ep_enabled,
         )
-        self.optimizer.zero_grad()
 
-    def optimizer_step(self):
-        """Perform optimizer step with gradient clipping."""
-        self.optimizer.step()
+        # if grad_norm is not finite, skip the update
+        if not torch.isfinite(grad_norm):
+            print(f"WARN: grad_norm is not finite: {grad_norm}")
+            self.optimizer.zero_grad()
+        else:
+            self.optimizer.step()
+        return grad_norm.item()
 
     def lr_scheduler_step(self):
         """Advance learning rate scheduler."""
@@ -471,7 +494,6 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
             input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)
-            # input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)
             output_args["input_ids_rmpad_rolled"] = input_ids_rmpad_rolled
 
             model_inputs = {
@@ -545,11 +567,6 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 inplace_backward=inplace_backward,
             )
 
-            # DEBUG: Compare log_probs statistics
-            if torch.distributed.get_rank() == 0:
-                print(f"DEBUG TorchTitan: input_ids_rmpad_rolled shape={input_ids_rmpad_rolled.shape}, min={input_ids_rmpad_rolled.min().item():.4f}, max={input_ids_rmpad_rolled.max().item(): .4f}, mean={input_ids_rmpad_rolled.float().mean().item():.4f}")
-                print(f"DEBUG TorchTitan: logits_rmpad shape={logits_rmpad.shape}, min={logits_rmpad.min().item():.4f}, max={logits_rmpad.max().item():.4f}, mean={logits_rmpad.mean().item():.4f}")
-                print(f"DEBUG TorchTitan: log_probs shape={log_probs.shape}, min={log_probs.min().item():.4f}, max={log_probs.max().item():.4f}, mean={log_probs.mean().item():.4f}")
             if calculate_entropy:
                 if not self.engine_config.entropy_checkpointing:
                     entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)
@@ -624,7 +641,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             input_dict = {
                 "input": model_inputs["input_ids"],
                 "positions": model_inputs["position_ids"],
-                "attention_masks": model_inputs["attention_mask"],
+                # "attention_masks": model_inputs["attention_mask"],
             }
 
             # _, logits = self.trainer.forward_backward_step(input_dict=input_dict, labels=output_args["input_ids_rmpad_rolled"], global_valid_tokens=torch.tensor(1.0, device=device_name), return_outputs=True)
@@ -643,7 +660,6 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                     assert forward_only, "forward_only must be True when loss_function is None"
                     loss = torch.tensor(1.0, device=device_name)
                     metrics: dict[Unknown, Unknown] = {}
-                print(f"jessica: {loss=}")
 
                 output = {
                     "model_output": model_output,

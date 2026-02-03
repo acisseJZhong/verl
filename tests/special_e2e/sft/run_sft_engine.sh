@@ -19,7 +19,7 @@ VAL_FILES=${DATASET_DIR}/test.parquet
 
 backend=${BACKEND:-fsdp}
 
-project_name=verl_sft_test
+project_name=verl_sft_test_02_02
 
 RESUME_MODE=disable
 
@@ -31,7 +31,7 @@ MODEL_PATH=${MODEL_PATH:-${HOME}/models/${MODEL_ID}}
 
 SP_SIZE=${SP_SIZE:-1}
 FSDP_SIZE=${FSDP_SIZE:-${NUM_GPUS}}
-FSDP_STRATEGY=${FSDP_STRATEGY:-"fsdp"}
+FSDP_STRATEGY=${FSDP_STRATEGY:-"fsdp2"}
 
 TP_SIZE=${TP_SIZE:-1}
 PP_SIZE=${PP_SIZE:-1}
@@ -84,13 +84,14 @@ FSDP_ENGINE_CONFIG="\
     optim.clip_grad=1.0 \
     optim.min_lr_ratio=0.1 \
     optim.lr_scheduler_type=cosine \
+    optim.total_training_steps=1000 \
     engine.ulysses_sequence_parallel_size=${SP_SIZE} \
     engine.strategy=${FSDP_STRATEGY} \
     engine.fsdp_size=${FSDP_SIZE} \
     engine.use_torch_compile=False \
     model=hf_model \
     model.path=${MODEL_PATH} \
-    +model.override_config.attn_implementation=sdpa"
+    +model.override_config.attn_implementation=flex_attention"
 
 TORCHTITAN_ENGINE_CONFIG="\
     engine=${backend} \
@@ -101,6 +102,8 @@ TORCHTITAN_ENGINE_CONFIG="\
     optim.betas="[0.9,0.95]" \
     optim.clip_grad=1.0 \
     optim.min_lr_factor=0.1 \
+    optim.decay_type=cosine \
+    optim.total_training_steps=1000 \
     engine.tensor_parallel_size=${TP_SIZE} \
     engine.pipeline_parallel_size=${PP_SIZE} \
     engine.context_parallel_size=${CP_SIZE} \
