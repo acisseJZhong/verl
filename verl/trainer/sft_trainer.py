@@ -238,8 +238,16 @@ class SFTTrainer:
             batch_seqlens: torch.Tensor = data["attention_mask"].sum(dim=-1)
         batch_seqlens = batch_seqlens.to(self.device_name)  # (global_bsz // dp)
 
+        dp_size = self.engine.get_data_parallel_size()
+        dp_group = self.engine.get_data_parallel_group()
+        print(f"{dp_size=}, {dp_group=}")
+
+        # No data parallelism or no DP group, skip all_gather
+        if dp_size == 1 or dp_group is None:
+            return batch_seqlens.tolist()
+
         output_tensor = torch.empty(
-            (batch_seqlens.shape[0] * self.engine.get_data_parallel_size(),),
+            (batch_seqlens.shape[0] * dp_size,),
             dtype=batch_seqlens.dtype,
             device=self.device_name,
         )  # (global_bsz,)
@@ -247,7 +255,7 @@ class SFTTrainer:
         torch.distributed.all_gather_into_tensor(
             output_tensor=output_tensor,
             input_tensor=batch_seqlens,
-            group=self.engine.get_data_parallel_group(),
+            group=dp_group,
         )
 
         batch_seqlens = output_tensor.tolist()

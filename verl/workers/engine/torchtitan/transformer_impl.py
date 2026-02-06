@@ -84,93 +84,80 @@ class TorchTitanEngine(BaseEngine):
         """
         super().__init__()
 
-        # Patch torchtitan's init_distributed to skip if verl has already
-        # called initialize_global_process_group()
-        # This avoids "trying to initialize the default process group twice"
-        original_init_distributed = dist_utils.init_distributed
+        self.model_config = model_config
+        self.engine_config = engine_config
+        self.optimizer_config = optimizer_config
+        self.checkpoint_config = checkpoint_config
 
-        def patched_init_distributed(*args, **kwargs):
-            if torch.distributed.is_initialized():
-                return torch.distributed.get_world_size()
-            return original_init_distributed(*args, **kwargs)
-
-        dist_utils.init_distributed = patched_init_distributed
-
-        # Patch train_spec to return a dummy dataloader since verl has its own data pipeline
+        # Disable torchtitan's dataloader since verl has its own data loading
+        # Ideally torchtitan trainer init should not initialize dataloader
         import torchtitan.protocols.train_spec as train_spec_module
         original_get_train_spec = train_spec_module.get_train_spec
 
-        def patched_get_train_spec(model_name):
+        def _get_train_spec_without_dataloader(model_name):
             train_spec = original_get_train_spec(model_name)
-
-            # Create a dummy dataloader function that returns None
-            # verl uses its own dataloader, not TorchTitan's
-            def dummy_build_dataloader_fn(*args, **kwargs):
-                return None
-
-            # Replace the dataloader builder with our dummy
-            train_spec.build_dataloader_fn = dummy_build_dataloader_fn
+            train_spec.build_dataloader_fn = None
             return train_spec
 
-        train_spec_module.get_train_spec = patched_get_train_spec
+        train_spec_module.get_train_spec = _get_train_spec_without_dataloader
 
-        self.model_config = Model(
-            name=model_config.name, flavor=model_config.flavor, hf_assets_path=model_config.hf_assets_path
+        # Get train_spec and directly override model_args before Trainer init
+        train_spec = train_spec_module.get_train_spec(self.model_config.name)
+        model_args = train_spec.model_args.get(self.model_config.flavor)
+        if model_args is not None:
+            if hasattr(model_args, "attn_type"):
+                model_args.attn_type = self.model_config.attn_type
+            if hasattr(model_args, "attn_mask_type"):
+                model_args.attn_mask_type = self.model_config.attn_mask_type
+
+        model = Model(
+            name=self.model_config.name, flavor=self.model_config.flavor, hf_assets_path=self.model_config.hf_assets_path
         )
-        self.engine_config = engine_config
+        optimizer = Optimizer(
+            name=self.optimizer_config.name,
+            lr=self.optimizer_config.lr,
+            eps=self.optimizer_config.eps,
+            beta1=self.optimizer_config.betas[0],
+            beta2=self.optimizer_config.betas[1],
+            weight_decay=self.optimizer_config.weight_decay,
+        )
 
-        total_steps = optimizer_config.total_training_steps
-        lr_warmup_steps = optimizer_config.lr_warmup_steps
+        total_steps = self.optimizer_config.total_training_steps
+        lr_warmup_steps = self.optimizer_config.lr_warmup_steps
         if lr_warmup_steps is None or lr_warmup_steps <= 0:
-            lr_warmup_steps = int(optimizer_config.lr_warmup_steps_ratio * total_steps)
+            lr_warmup_steps = int(self.optimizer_config.lr_warmup_steps_ratio * total_steps)
 
-        self.optimizer_config = Optimizer(
-            name=optimizer_config.name,
-            lr=optimizer_config.lr,
-            eps=optimizer_config.eps,
-            beta1=optimizer_config.betas[0],
-            beta2=optimizer_config.betas[1],
-            weight_decay=optimizer_config.weight_decay,
-            implementation="foreach",  # Match FSDP's default optimizer behavior
-        )
-        self.lr_scheduler_config = LRScheduler(
+        lr_scheduler = LRScheduler(
             warmup_steps=lr_warmup_steps,
-            decay_ratio=None,  # None means decay starts immediately after warmup
-            decay_type=optimizer_config.decay_type,
-            min_lr_factor=optimizer_config.min_lr_factor,
+            decay_type=self.optimizer_config.decay_type,
+            min_lr_factor=self.optimizer_config.min_lr_factor,
         )
-        self.parallelism_config = Parallelism(
-            data_parallel_replicate_degree=engine_config.data_parallel_replicate_size,
-            data_parallel_shard_degree=engine_config.data_parallel_shard_size,
-            fsdp_reshard_after_forward=engine_config.reshard_after_forward,
-            tensor_parallel_degree=engine_config.tensor_parallel_size,
-            pipeline_parallel_degree=engine_config.pipeline_parallel_size,
-            context_parallel_degree=engine_config.context_parallel_size,
-            expert_parallel_degree=engine_config.expert_parallel_size,
-            expert_tensor_parallel_degree=engine_config.expert_tensor_parallel_size,
+        parallelism = Parallelism(
+            data_parallel_replicate_degree=self.engine_config.data_parallel_replicate_size,
+            data_parallel_shard_degree=self.engine_config.data_parallel_shard_size,
+            fsdp_reshard_after_forward=self.engine_config.reshard_after_forward,
+            tensor_parallel_degree=self.engine_config.tensor_parallel_size,
+            pipeline_parallel_degree=self.engine_config.pipeline_parallel_size,
+            context_parallel_degree=self.engine_config.context_parallel_size,
+            expert_parallel_degree=self.engine_config.expert_parallel_size,
+            expert_tensor_parallel_degree=self.engine_config.expert_tensor_parallel_size,
         )
-        self.checkpoint_config = Checkpoint(
+        checkpoint = Checkpoint(
             enable=True,
             initial_load_in_hf=True,
             initial_load_model_only=True,
             initial_load_path=model_config.hf_assets_path,
         )
-        self.compile_config = Compile(enable=engine_config.use_torch_compile)
-        self.training_config = Training(
-            dtype="float32",  # Match FSDP's bfloat16 weights
-            mixed_precision_param="bfloat16",
-            mixed_precision_reduce="float32",
-        )
+        compile = Compile(enable=self.engine_config.use_torch_compile)
 
         # Construct Torchtitan's JobConfig
         self.config = JobConfig(
-            model=self.model_config,
-            optimizer=self.optimizer_config,
-            lr_scheduler=self.lr_scheduler_config,
-            parallelism=self.parallelism_config,
-            checkpoint=self.checkpoint_config,
-            compile=self.compile_config,
-            training=self.training_config,
+            model=model,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            parallelism=parallelism,
+            checkpoint=checkpoint,
+            compile=compile,
         )
         self.trainer = Trainer(self.config)
 
@@ -230,6 +217,7 @@ class TorchTitanEngine(BaseEngine):
         """
         self.module = self.trainer.model_parts
         self.checkpointer = self.trainer.checkpointer
+        # load initial HF weights
         self.checkpointer.load()
 
         if not self.engine_config.forward_only:
@@ -273,24 +261,17 @@ class TorchTitanEngine(BaseEngine):
 
     def get_data_parallel_rank(self):
         mesh = self.parallel_dims.get_optional_mesh(["dp_replicate", "fsdp"])
-        if mesh is None:
-            # No data parallelism, return rank 0
-            return 0
-        return mesh.get_local_rank()
+        return 0 if mesh is None else mesh.get_local_rank()
 
     def get_data_parallel_size(self):
         mesh = self.parallel_dims.get_optional_mesh(["dp_replicate", "fsdp"])
-        if mesh is None:
-            # No data parallelism, return size 1
-            return 1
-        return mesh.size()
+        return 1 if mesh is None else mesh.size()
 
     def get_data_parallel_group(self):
         mesh = self.parallel_dims.get_optional_mesh(["dp_replicate", "fsdp"])
         if mesh is None:
-            # No data parallelism, return None or world group
             return None
-        return mesh
+        return mesh.get_group()
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False):
         """Perform forward and optionally backward pass on a batch."""
@@ -445,7 +426,6 @@ class EngineEvalModeCtx(BaseEngineCtx):
 
         # Reshard the root FSDP module
         if self.engine.engine_config.data_parallel_shard_size > 1:
-            # TODO(jessicazhong): figure out FSDP reshard correctly
             for module in self.engine.module:
                 module.reshard()
 
@@ -641,11 +621,10 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             input_dict = {
                 "input": model_inputs["input_ids"],
                 "positions": model_inputs["position_ids"],
-                # "attention_masks": model_inputs["attention_mask"],
+                "attention_masks": model_inputs["attention_mask"],
             }
 
-            # _, logits = self.trainer.forward_backward_step(input_dict=input_dict, labels=output_args["input_ids_rmpad_rolled"], global_valid_tokens=torch.tensor(1.0, device=device_name), return_outputs=True)
-            _, logits = self.trainer.forward_backward_step(input_dict=input_dict, labels=output_args["input_ids_rmpad_rolled"])
+            _, logits = self.trainer.forward_step(input_dict=input_dict, labels=output_args["input_ids_rmpad_rolled"], global_valid_tokens=torch.tensor(1.0, device=device_name), return_outputs=True)
 
             if self.is_mp_src_rank_with_outputs():
                 model_output: dict[str, Unknown] = self.prepare_model_outputs(
