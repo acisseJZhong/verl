@@ -19,18 +19,19 @@ VAL_FILES=${DATASET_DIR}/test.parquet
 
 backend=${BACKEND:-fsdp}
 
-project_name=verl_sft_test_02_02
+project_name=verl_sft_test_llama3.1
 
 RESUME_MODE=disable
 
 ckpts_home=${ckpts_home:-~/verl/test/gsm8k-sft-${backend}}
 
-MODEL_ID=${MODEL_ID:-Qwen/Qwen3-0.6B}
+# MODEL_ID=${MODEL_ID:-Qwen/Qwen3-0.6B}
+MODEL_ID=${MODEL_ID:-meta-llama/Llama-3.1-8B-Instruct}
 MODEL_PATH=${MODEL_PATH:-${HOME}/models/${MODEL_ID}}
 #huggingface-cli download "${MODEL_ID}" --local-dir "${MODEL_PATH}"
 
 SP_SIZE=${SP_SIZE:-1}
-FSDP_SIZE=${FSDP_SIZE:-${NUM_GPUS}}
+FSDP_SIZE=${FSDP_SIZE:-1}
 FSDP_STRATEGY=${FSDP_STRATEGY:-"fsdp2"}
 
 TP_SIZE=${TP_SIZE:-1}
@@ -91,7 +92,7 @@ FSDP_ENGINE_CONFIG="\
     engine.use_torch_compile=False \
     model=hf_model \
     model.path=${MODEL_PATH} \
-    +model.override_config.attn_implementation=flex_attention"
+    +model.override_config.attn_implementation=sdpa"
 
 TORCHTITAN_ENGINE_CONFIG="\
     engine=${backend} \
@@ -110,6 +111,8 @@ TORCHTITAN_ENGINE_CONFIG="\
     engine.data_parallel_size=${FSDP_SIZE} \
     engine.use_torch_compile=False \
     model=torchtitan_model \
+    model.attn_type=sdpa \
+    model.attn_mask_type=causal \
     model.hf_assets_path=${MODEL_PATH}"
 
 

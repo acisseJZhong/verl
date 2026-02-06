@@ -168,6 +168,8 @@ class TorchtitanModelConfig(BaseConfig):
         "processor",
         "hf_config",
         "local_hf_assets_path",
+        "attn_type",
+        "attn_mask_type",
     }
 
     name: str = "qwen3"
@@ -184,6 +186,10 @@ class TorchtitanModelConfig(BaseConfig):
     trust_remote_code: bool = False
 
     use_remove_padding: bool = True
+
+    # Model args overrides
+    attn_type: str = 'sdpa'  # e.g., "sdpa", "flex", "varlen"
+    attn_mask_type: str = 'causal'  # e.g., "causal", "document_mask", "block_causal"
 
     def __post_init__(self):
         self.local_hf_assets_path = copy_to_local(self.hf_assets_path, use_shm=self.use_shm)
