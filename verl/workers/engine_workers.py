@@ -76,7 +76,7 @@ class TrainingWorker(Worker):
         # DistProfilerExtension.__init__(
         #     self, DistProfiler(rank=self.rank, config=self.profiler_config, tool_config=tool_config)
         # )
-        print(f"jessica: {self.config.model_type=} and {self.engine_config.strategy=} and {self.config=}")
+
         self.engine: BaseEngine = EngineRegistry.new(
             model_type=self.config.model_type,
             backend=self.engine_config.strategy,
@@ -279,9 +279,6 @@ class TrainingWorker(Worker):
         # update lr scheduler
         if update_lr_scheduler:
             lr = self.engine.lr_scheduler_step()
-            # DEBUG: Print LR value for comparison
-            if torch.distributed.get_rank() == 0:
-                print(f"DEBUG LR: engine={self.engine.__class__.__name__} lr={lr}")
         else:
             lr = None
 
