@@ -44,6 +44,8 @@ USE_REMOVE_PADDING=${USE_REMOVE_PADDING:-True}
 
 FSDP_ENGINE_CONFIG="\
     engine=${backend} \
+    model=hf_model \
+    model.path=$MODEL_PATH \
     optim=${backend} \
     optim.lr=1e-5 \
     optim.lr_warmup_steps_ratio=0.2 \
@@ -58,6 +60,8 @@ FSDP_ENGINE_CONFIG="\
 
 VEOMNI_ENGINE_CONFIG="\
     engine=${backend} \
+    model=hf_model \
+    model.path=$MODEL_PATH \
     optim=${backend} \
     optim.lr=1e-5 \
     optim.lr_warmup_steps_ratio=0.2 \
@@ -73,6 +77,8 @@ VEOMNI_ENGINE_CONFIG="\
 
 MEGATRON_ENGINE_CONFIG="\
     engine=${backend} \
+    model=hf_model \
+    model.path=$MODEL_PATH \
     optim=${backend} \
     optim.lr=1e-5 \
     optim.lr_warmup_steps_ratio=0.2 \
@@ -90,6 +96,10 @@ MEGATRON_ENGINE_CONFIG="\
 
 TORCHTITAN_ENGINE_CONFIG="\
     engine=${backend} \
+    model=torchtitan_model \
+    model.attn_type=varlen \
+    model.attn_mask_type=position_block_causal \
+    model.hf_assets_path=${MODEL_PATH}
     optim=${backend} \
     optim.lr=1e-5 \
     optim.lr_warmup_steps_ratio=0.2 \
@@ -103,11 +113,7 @@ TORCHTITAN_ENGINE_CONFIG="\
     engine.pipeline_parallel_size=${PP_SIZE} \
     engine.context_parallel_size=${CP_SIZE} \
     engine.data_parallel_size=${FSDP_SIZE} \
-    engine.use_torch_compile=False \
-    model=torchtitan_model \
-    model.attn_type=flex \
-    model.attn_mask_type=document_mask \
-    model.hf_assets_path=${MODEL_PATH}"
+    engine.use_torch_compile=False"
 
 
 if [ "$backend" = "fsdp" ]; then
@@ -139,7 +145,6 @@ $COMMAND \
     data.use_dynamic_bsz=True \
     data.max_token_len_per_gpu=2048 \
     data.messages_key=messages \
-    model.path=$MODEL_PATH \
     model.use_remove_padding=${USE_REMOVE_PADDING} \
     data.ignore_input_ids_mismatch=True \
     ${ENGINE_CONFIG} \
@@ -156,5 +161,5 @@ $COMMAND \
     # trainer.total_training_steps=${TOTAL_TRAIN_STEP} \
     # trainer.checkpoint.save_contents=[model,optimizer,extra,hf_model] \
     # trainer.max_ckpt_to_keep=1 \
-    
+
 rm -rf "${ckpts_home:?}/*"

@@ -316,6 +316,34 @@ class TorchTitanEngine(BaseEngine):
         else:
             return {}
 
+    def model_forward_step(
+        self,
+        *,
+        input_dict: dict[str, torch.Tensor],
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Perform a forward pass through the trainer model without backward.
+        """
+        model_parts = self.module
+        parallel_dims = self.parallel_dims
+
+        inputs, labels, extra_inputs, extra_kwargs = self.trainer.post_dataloading_process(input_dict, labels)
+
+        if parallel_dims.pp_enabled:
+            raise NotImplementedError(
+                "Pipeline parallelism is not yet supported in model_forward_step. "
+                "This will be implemented in a follow-up PR."
+            )
+        else:
+            # Non-PP forward
+            assert len(model_parts) == 1
+            with self.trainer.train_context():
+                with self.trainer.maybe_enable_amp:
+                    pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
+
+        return pred
+
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         raise NotImplementedError("forward_step must be implemented in subclass")
 
@@ -631,13 +659,12 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
         with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
-            # shifted_input shape torch.Size([1, 1912]), labels shape torch.Size([1, 1912])
             input_dict = {
                 "input": model_inputs["input_ids"],
                 "positions": model_inputs["position_ids"],
                 "attention_masks": model_inputs["attention_mask"],
             }
-            logits = self.trainer.forward_step(input_dict=input_dict, labels=output_args["input_ids_rmpad_rolled"])
+            logits = self.model_forward_step(input_dict=input_dict, labels=output_args["input_ids_rmpad_rolled"])
 
             if self.is_mp_src_rank_with_outputs():
                 model_output = self.prepare_model_outputs(
