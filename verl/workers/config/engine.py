@@ -285,14 +285,14 @@ class TorchtitanEngineConfig(EngineConfig):
         forward_prefetch (bool): Whether to prefetch parameters for next forward pass, default False
         use_orig_params (bool): Whether to use original parameters when initialize FSDP, default False
         mixed_precision (bool): Mixed precision configuration for FSDP, default False
-        data_parallel_size (int): FSDP group size, default 1
+        data_parallel_size (int): Data parallel group size, default 1
         data_parallel_replicate_size (int): Data parallel replicate size, default 1
         data_parallel_shard_size (int): Data parallel shard degree, default 1
         tensor_parallel_size (int): Tensor parallel size, default 1
         expert_parallel_size (int): Expert parallel size, default 1
         expert_tensor_parallel_size (int): Expert tensor parallel size, default 1
         pipeline_parallel_size (int): Pipeline parallel size, default 1
-        context_parallel_size (int): Ring-attn context parallel size, default 1
+        context_parallel_size (int): Context parallel size, default 1
         strategy (str): Strategy to use for distributed training, default "torchtitan"
         seed (int): Random seed for reproducibility.
         full_determinism (bool): If true, enable_full_determinism is called to ensure reproducible results

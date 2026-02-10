@@ -20,21 +20,14 @@ import logging
 import os
 import re
 from contextlib import nullcontext
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import torch
 import torch.distributed
 from tensordict import TensorDict
-from torchtitan.config.job_config import (
-    Checkpoint,
-    Compile,
-    JobConfig,
-    LRScheduler,
-    Model,
-    Optimizer,
-    Parallelism,
-)
+from torchtitan.config.job_config import Checkpoint, Compile, JobConfig, LRScheduler, Model, Optimizer, Parallelism
 from torchtitan.distributed import utils as dist_utils
+from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.train import Trainer
 
@@ -53,6 +46,7 @@ from verl.utils.fsdp_utils import (
 from verl.utils.model import extract_multi_modal_inputs
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.workers.config import TorchtitanEngineConfig, TorchtitanModelConfig, TorchtitanOptimizerConfig
+from verl.workers.engine.torchtitan.utils import get_attention_masks
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
 from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
@@ -319,16 +313,15 @@ class TorchTitanEngine(BaseEngine):
     def model_forward_step(
         self,
         *,
-        input_dict: dict[str, torch.Tensor],
-        labels: torch.Tensor,
+        inputs: torch.Tensor,
+        extra_inputs: dict[str, torch.Tensor] | None = None,
+        extra_kwargs: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """
         Perform a forward pass through the trainer model without backward.
         """
         model_parts = self.module
         parallel_dims = self.parallel_dims
-
-        inputs, labels, extra_inputs, extra_kwargs = self.trainer.post_dataloading_process(input_dict, labels)
 
         if parallel_dims.pp_enabled:
             raise NotImplementedError(
@@ -504,90 +497,93 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         multi_modal_inputs = extract_multi_modal_inputs(micro_batch.get("multi_modal_inputs", []))
         input_ids = micro_batch["input_ids"]
         position_ids = micro_batch["position_ids"]
-
         output_args = {}
 
         if use_remove_padding:
-            if pad_mode == DatasetPadMode.NO_PADDING:
-                input_ids_rmpad = input_ids.values().unsqueeze(0)
-                if position_ids.dim() == 3:
-                    position_ids_rmpad = position_ids.values().unsqueeze(1)
-                else:
-                    position_ids_rmpad = position_ids.values().unsqueeze(0)
+            input_ids = input_ids.values().unsqueeze(0)
+            if position_ids.dim() == 3:
+                position_ids = position_ids.values().unsqueeze(1)
             else:
-                raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
+                position_ids = position_ids.values().unsqueeze(0)
 
-            input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)
-            output_args["input_ids_rmpad_rolled"] = input_ids_rmpad_rolled
-
-            model_inputs = {
-                "input_ids": input_ids_rmpad,
-                "attention_mask": None,
-                "position_ids": position_ids_rmpad,
-            }
+            labels = torch.roll(input_ids, shifts=-1, dims=1)
+            attn_type = self.trainer.model_args.attn_type
+            attention_mask = get_attention_masks(
+                input_batch=input_ids,
+                positions=position_ids,
+                attn_type=attn_type,
+            )
         else:
-            if pad_mode == DatasetPadMode.NO_PADDING:
-                loss_mask = micro_batch["loss_mask"]
+            loss_mask = micro_batch["loss_mask"]
+            pad_token_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
+            batch_size = micro_batch.batch_size[0]
+            max_seq_len = max(input_ids.offsets().diff())
 
-                pad_token_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
-                batch_size = micro_batch.batch_size[0]
-                seq_len_effective = input_ids.offsets().diff()
-                max_seq_len = max(seq_len_effective)
+            labels = torch.roll(input_ids.values(), shifts=-1, dims=0)
+            input_ids = torch.nested.to_padded_tensor(
+                input_ids, padding=pad_token_id, output_size=(batch_size, max_seq_len)
+            )
 
-                input_ids_rmpad_rolled = torch.roll(input_ids.values(), shifts=-1, dims=0)
-                output_args["input_ids_rmpad_rolled"] = input_ids_rmpad_rolled
-
-                input_ids = torch.nested.to_padded_tensor(
-                    input_ids, padding=pad_token_id, output_size=(batch_size, max_seq_len)
-                )
-
-                if position_ids.dim() == 3:
-                    position_ids = torch.nested.to_padded_tensor(
-                        position_ids, padding=0, output_size=(batch_size, 4, max_seq_len)
-                    ).transpose(0, 1)
-                else:
-                    position_ids = torch.nested.to_padded_tensor(
-                        position_ids, padding=0, output_size=(batch_size, max_seq_len)
-                    )
-
-                attention_mask_list = [torch.ones_like(t, dtype=torch.int32) for t in loss_mask]
-                attention_mask = torch.nested.as_nested_tensor(attention_mask_list, layout=torch.jagged)
-                attention_mask = torch.nested.to_padded_tensor(
-                    attention_mask, padding=0, output_size=(batch_size, max_seq_len)
-                )
-
-                model_inputs = {
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask,
-                    "position_ids": position_ids,
-                }
+            if position_ids.dim() == 3:
+                position_ids = torch.nested.to_padded_tensor(
+                    position_ids, padding=0, output_size=(batch_size, 4, max_seq_len)
+                ).transpose(0, 1)
             else:
-                raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
+                position_ids = torch.nested.to_padded_tensor(
+                    position_ids, padding=0, output_size=(batch_size, max_seq_len)
+                )
 
-        model_inputs.update(multi_modal_inputs)
-        return model_inputs, output_args
+            attention_mask_list = [torch.ones_like(t, dtype=torch.int32) for t in loss_mask]
+            attention_mask = torch.nested.as_nested_tensor(attention_mask_list, layout=torch.jagged)
+            attention_mask = torch.nested.to_padded_tensor(
+                attention_mask, padding=0, output_size=(batch_size, max_seq_len)
+            )
+
+        extra_inputs = {
+            "positions": position_ids,
+        }
+        # For arguments, like attention_masks, we have to put them in a separate
+        # dict as extra_inputs are not forwarded to other stages in PP, but
+        # extra_kwargs are.
+        extra_kwargs: dict[str, Any] = {"attention_masks": attention_mask}
+        if self.parallel_dims.cp_enabled:
+            input_ids, labels, extra_kwargs = prepare_context_parallel_input(
+                input_ids,
+                labels,
+                extra_kwargs,
+                self.parallel_dims.get_mesh("cp"),
+                self.trainer.device,
+                self.trainer.job_config.parallelism.context_parallel_load_balancer,
+            )
+
+        # TODO(jessicazhong): multimodal is not yet supported for Torchtitan engine
+        extra_inputs.update(multi_modal_inputs)
+        output_args["labels"] = labels
+        return input_ids, extra_inputs, extra_kwargs, output_args
 
     def prepare_model_outputs(self, logits, output_args, micro_batch: TensorDict):
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
+        assert pad_mode == DatasetPadMode.NO_PADDING, f"pad_mode {pad_mode} not supported"
+
         temperature = micro_batch["temperature"]
         calculate_entropy = tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False)
-
+        labels = output_args["labels"]
         model_output = {}
 
         input_ids = micro_batch["input_ids"]
+        cu_seqlens = input_ids.offsets()
         if use_remove_padding:
-            input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"].squeeze(0)
+            labels = labels.squeeze(0)
             logits_rmpad = logits.squeeze(0)
             logits_rmpad.div_(temperature)
 
             inplace_backward = True
             if calculate_entropy:
                 inplace_backward = False
-            # logits_rmpad torch.Size([1912, 151936]), input_ids_rmpad_rolled torch.Size([1, 1912])
             log_probs = logprobs_from_logits(
                 logits=logits_rmpad,
-                labels=input_ids_rmpad_rolled,
+                labels=labels,
                 inplace_backward=inplace_backward,
             )
 
@@ -614,15 +610,9 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             #             unpad_dim=0,
             #             padding_size=pad_size,
             #         )
-
-            if pad_mode == DatasetPadMode.NO_PADDING:
-                cu_seqlens = input_ids.offsets()
-                log_probs = torch.nested.nested_tensor_from_jagged(log_probs.squeeze(0), cu_seqlens)
-                if calculate_entropy:
-                    entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
-            else:
-                raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
-
+            log_probs = torch.nested.nested_tensor_from_jagged(log_probs.squeeze(0), cu_seqlens)
+            if calculate_entropy:
+                entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
         else:
             logits.div_(temperature)
             if calculate_entropy:
@@ -631,21 +621,16 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 else:
                     entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
-            if pad_mode == DatasetPadMode.NO_PADDING:
-                cu_seqlens = input_ids.offsets()
-                seq_lengths = cu_seqlens.diff()
-                starts = torch.zeros_like(seq_lengths, dtype=torch.int64)
-                logits = torch.nested.narrow(logits, 1, starts, seq_lengths, layout=torch.jagged)
-                logits_rmpad = torch.cat([t for t in logits.unbind()])
-                input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
-                log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
-                log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
-                if calculate_entropy:
-                    entropy = torch.nested.narrow(entropy, 1, starts, seq_lengths, layout=torch.jagged)
-                    entropy_rmpad = torch.cat([t for t in entropy.unbind()])
-                    entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
-            else:
-                raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
+            seq_lengths = cu_seqlens.diff()
+            starts = torch.zeros_like(seq_lengths, dtype=torch.int64)
+            logits = torch.nested.narrow(logits, 1, starts, seq_lengths, layout=torch.jagged)
+            logits_rmpad = torch.cat([t for t in logits.unbind()])
+            log_probs = logprobs_from_logits(logits=logits_rmpad, labels=output_args["labels"])
+            log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
+            if calculate_entropy:
+                entropy = torch.nested.narrow(entropy, 1, starts, seq_lengths, layout=torch.jagged)
+                entropy_rmpad = torch.cat([t for t in entropy.unbind()])
+                entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
 
         model_output["log_probs"] = log_probs
         if calculate_entropy:
@@ -656,15 +641,10 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         device_name = get_device_name()
         micro_batch = micro_batch.to(get_device_id())
-        model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
+        input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
         with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
-            input_dict = {
-                "input": model_inputs["input_ids"],
-                "positions": model_inputs["position_ids"],
-                "attention_masks": model_inputs["attention_mask"],
-            }
-            logits = self.model_forward_step(input_dict=input_dict, labels=output_args["input_ids_rmpad_rolled"])
+            logits = self.model_forward_step(inputs=input_ids, extra_inputs=extra_inputs, extra_kwargs=extra_kwargs)
 
             if self.is_mp_src_rank_with_outputs():
                 model_output = self.prepare_model_outputs(
