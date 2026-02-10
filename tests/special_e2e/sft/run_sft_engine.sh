@@ -19,7 +19,7 @@ VAL_FILES=${DATASET_DIR}/test.parquet
 
 backend=${BACKEND:-fsdp}
 
-project_name=verl_sft_test_0209
+project_name=verl_sft_test
 
 RESUME_MODE=disable
 

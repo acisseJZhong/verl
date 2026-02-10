@@ -68,7 +68,7 @@ def _create_varlen_metadata_for_document(input_batch: torch.Tensor, positions: t
     Creates cumulative sequence length indices needed for variable length attention
 
     Args:
-        input_ids: Input token IDs with shape [batch, seq].
+        input_batch: Input token IDs with shape [batch, seq].
         positions: Position IDs with shape [batch, seq]. Boundaries detected where
             position diff != 1 (i.e., position resets).
 
