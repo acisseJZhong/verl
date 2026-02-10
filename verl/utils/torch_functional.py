@@ -743,6 +743,8 @@ def get_cosine_schedule_with_warmup(
     assert init_lr_ratio >= 0 and init_lr_ratio <= 1.0
 
     def lr_lambda(current_step):
+        # # 0-indexed step, hence + 1 adjustments
+        current_step += 1
         if current_step < num_warmup_steps:
             return init_lr_ratio + (1.0 - init_lr_ratio) * (float(current_step) / float(max(1, num_warmup_steps)))
         progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))

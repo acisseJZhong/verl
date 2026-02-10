@@ -19,7 +19,7 @@ VAL_FILES=${DATASET_DIR}/test.parquet
 
 backend=${BACKEND:-fsdp}
 
-project_name=verl_sft_test
+project_name=verl_sft_test_0209
 
 RESUME_MODE=disable
 
@@ -97,7 +97,6 @@ TORCHTITAN_ENGINE_CONFIG="\
     engine=${backend} \
     model=torchtitan_model \
     model.attn_type=varlen \
-    model.attn_mask_type=position_block_causal \
     model.hf_assets_path=${MODEL_PATH}
     optim=${backend} \
     optim.lr=1e-5 \
