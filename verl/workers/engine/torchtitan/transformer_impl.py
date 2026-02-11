@@ -719,27 +719,25 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             micro_batch = micro_batch.to(get_device_id())
             input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
-            input_ids_mbs.append((input_ids,))  # Each microbatch as a tuple
+            # input_ids_mbs is a list of tensors: [input_ids_0, input_ids_1, ...]
+            input_ids_mbs.append(input_ids)
             extra_inputs_mbs.append(extra_inputs)
             extra_kwargs_mbs.append(extra_kwargs)
             target_mbs.append(output_args["labels"])
 
-        # input_ids_mbs is a list of tuples: [(input_ids_0,), (input_ids_1,), ...]
-        # Keep as list for now to allow padding modifications, convert to tuple at end
-
         # Pad inputs to max_seq_len across all microbatches for consistent shapes in PP
         # This is critical for PP because shape inference happens once and all microbatches
         # must have consistent shapes for send/receive buffers
-        max_seq_len = max(input_ids_mbs[i][0].size(1) for i in range(len(input_ids_mbs)))
-        original_seq_lens = [input_ids_mbs[i][0].size(1) for i in range(len(input_ids_mbs))]
+        max_seq_len = max(input_ids_mbs[i].size(1) for i in range(len(input_ids_mbs)))
+        original_seq_lens = [input_ids_mbs[i].size(1) for i in range(len(input_ids_mbs))]
         for i in range(len(input_ids_mbs)):
-            input_ids = input_ids_mbs[i][0]
+            input_ids = input_ids_mbs[i]
             orig_seq_len = input_ids.size(1)
             pad_size = max_seq_len - orig_seq_len
             if pad_size > 0:
                 # Pad input_ids
                 input_ids_padded = torch.nn.functional.pad(input_ids, (0, pad_size), value=0)
-                input_ids_mbs[i] = (input_ids_padded,)
+                input_ids_mbs[i] = input_ids_padded
 
                 # Pad positions in kwarg_mbs
                 positions = extra_inputs_mbs[i]["positions"]
@@ -785,9 +783,6 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                     target_padded = torch.nn.functional.pad(target, (0, pad_size), value=0)
                     target_mbs[i] = target_padded
 
-        # Convert to final tuple of tuples structure for PP schedule
-        input_ids_mbs = tuple(input_ids_mbs)
-
         # Create PP-compatible loss function wrapper
         # PP schedule calls loss_fn(output, target) where:
         # - output: model logits tensor
@@ -807,6 +802,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             """
             mb_idx = current_mb_idx[0]
             micro_batch = micro_batches[mb_idx]
+            micro_batch = micro_batch.to(logits.device)
             orig_seq_len = original_seq_lens[mb_idx]
             current_mb_idx[0] += 1
 
@@ -817,7 +813,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             # Compute log_probs from logits (similar to prepare_model_outputs)
             temperature = micro_batch["temperature"]
             input_ids = micro_batch["input_ids"]
-            cu_seqlens = input_ids.offsets()
+            cu_seqlens = input_ids.offsets().to(logits.device)
 
             # Process logits similar to prepare_model_outputs
             labels_squeezed = labels.squeeze(0) if labels.dim() > 1 else labels
@@ -854,18 +850,19 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             schedule_class = get_schedule_class(self.config.parallelism.pipeline_parallel_schedule)
             stages = self.trainer.pp_schedule._stages
             # Create new schedule with correct n_microbatches
-            # Note: loss_fn will be overridden below, so pass None here
+            # Pass pp_loss_fn as loss_fn so _has_backward is set to True
             self.trainer.pp_schedule = schedule_class(
                 stages=stages,
                 n_microbatches=n_microbatches,
-                loss_fn=None,
+                loss_fn=pp_loss_fn,
                 scale_grads=False,
             )
-
-        # Set has_backward based on forward_only flag
-        self.trainer.pp_schedule._has_backward = not forward_only
-        # Override loss_fn to use our PP-compatible wrapper
-        self.trainer.pp_schedule._loss_fn = pp_loss_fn
+        else:
+            # Override loss_fn to use our PP-compatible wrapper
+            self.trainer.pp_schedule._loss_fn = pp_loss_fn
+            # Ensure _has_backward is True for training
+            if not forward_only:
+                self.trainer.pp_schedule._has_backward = True
 
         with self.trainer.train_context():
             targets, losses = (target_mbs, []) if self.trainer.pp_has_last_stage else (None, None)
@@ -875,27 +872,45 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 # Reset microbatch index for loss function
                 current_mb_idx[0] = 0
 
-                # Use private _step_microbatches API with pre-split microbatches
-                # For non-first stages, arg_mbs should be None (they receive activations from prev stage)
-                import fbvscode
-
-                fbvscode.set_trace()
+                # Use step() for training (backward enabled) or eval() for inference (forward only)
+                # arg_mbs format: list of tuples, one per microbatch
                 if self.trainer.pp_has_first_stage:
-                    self.trainer.pp_schedule.eval(
-                        input_ids_mbs=input_ids_mbs,
-                        **extra_inputs_mbs,
-                        **extra_kwargs_mbs,
-                        target=target_mbs,
-                        losses=losses,
-                        return_outputs=False,
-                    )
+                    arg_mbs = [(input_ids,) for input_ids in input_ids_mbs]
+                    if forward_only:
+                        self.trainer.pp_schedule.eval(
+                            arg_mbs,
+                            **extra_inputs,  # TODO(jessicazhong): figure out what should we pass in
+                            **extra_kwargs,  # TODO(jessicazhong): figure out what should we pass in
+                            target=targets,
+                            losses=losses,
+                            return_outputs=True,
+                        )
+                    else:
+                        self.trainer.pp_schedule.step(
+                            arg_mbs,
+                            **extra_inputs,
+                            **extra_kwargs,
+                            target=targets,
+                            losses=losses,
+                        )
                 else:
-                    self.trainer.pp_schedule.eval(
-                        input_ids_mbs=input_ids_mbs,
-                        **extra_kwargs_mbs,
-                        losses=losses,
-                        return_outputs=False,
-                    )
+                    # Non-first stages don't provide inputs, but need empty tuples matching n_microbatches
+                    arg_mbs = [()] * n_microbatches
+                    if forward_only:
+                        self.trainer.pp_schedule.eval(
+                            arg_mbs,  # TODO(jessicazhong): figure out if we should pass in this input
+                            **extra_kwargs,  # TODO(jessicazhong): figure out what should we pass in
+                            target=targets,
+                            losses=losses,
+                            return_outputs=True,
+                        )
+                    else:
+                        self.trainer.pp_schedule.step(
+                            arg_mbs,
+                            **extra_kwargs,
+                            target=targets,
+                            losses=losses,
+                        )
 
         if self.is_mp_src_rank_with_outputs():
             # Aggregate loss from PP schedule
