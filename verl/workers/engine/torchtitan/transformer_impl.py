@@ -709,80 +709,51 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         2. Stores microbatch data for use in the loss function wrapper
         3. Rebuilds the PP schedule when n_microbatches changes to recompute pipeline_order
         """
-        device_name = get_device_name()
-        n_microbatches = len(micro_batches)
-
-        # Rebuild PP schedule if n_microbatches changed
-        # The schedule's pipeline_order is computed at init time based on n_microbatches
-        # and cannot be simply overridden. We need to create a new schedule instance.
-        if self.trainer.pp_schedule._n_microbatches != n_microbatches:
-            schedule_class = get_schedule_class(self.config.parallelism.pipeline_parallel_schedule)
-            stages = self.trainer.pp_schedule._stages
-            # Create new schedule with correct n_microbatches
-            # Note: loss_fn will be overridden below, so pass None here
-            self.trainer.pp_schedule = schedule_class(
-                stages=stages,
-                n_microbatches=n_microbatches,
-                loss_fn=None,
-                scale_grads=False,
-            )
-
-        pp_schedule = self.trainer.pp_schedule
-
-        # Prepare inputs for all microbatches as separate arg/kwarg tuples
-        arg_mbs = []  # List of tuples: [(input_ids,), (input_ids,), ...]
-        kwarg_mbs = []  # List of dicts: [{positions: ..., attention_masks: ...}, ...]
+        # Prepare inputs for all microbatches
+        input_ids_mbs = []  # List of input_ids tensors: [input_ids_0, input_ids_1, ...]
+        extra_inputs_mbs = []  # List of dicts: [{positions: ...}, ...]
+        extra_kwargs_mbs = []  # List of dicts: [{attention_masks: ...}, ...]
         target_mbs = []  # List of labels tensors
-        microbatch_data = []  # Store microbatch TensorDicts for loss computation
 
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
-            # Positional args as tuple
-            arg_mbs.append((input_ids,))
-
-            # Merge extra_inputs and extra_kwargs for kwargs
-            mb_kwargs = {}
-            mb_kwargs.update(extra_inputs)
-            mb_kwargs.update(extra_kwargs)
-            kwarg_mbs.append(mb_kwargs)
-
-            # Target labels
+            input_ids_mbs.append((input_ids,))  # Each microbatch as a tuple
+            extra_inputs_mbs.append(extra_inputs)
+            extra_kwargs_mbs.append(extra_kwargs)
             target_mbs.append(output_args["labels"])
 
-            # Store microbatch data for loss computation
-            microbatch_data.append(micro_batch)
-
-        losses = [] if self.trainer.pp_has_last_stage else None
+        # input_ids_mbs is a list of tuples: [(input_ids_0,), (input_ids_1,), ...]
+        # Keep as list for now to allow padding modifications, convert to tuple at end
 
         # Pad inputs to max_seq_len across all microbatches for consistent shapes in PP
         # This is critical for PP because shape inference happens once and all microbatches
         # must have consistent shapes for send/receive buffers
-        max_seq_len = max(arg_mbs[i][0].size(1) for i in range(len(arg_mbs)))
-        original_seq_lens = [arg_mbs[i][0].size(1) for i in range(len(arg_mbs))]
-        for i in range(len(arg_mbs)):
-            input_ids = arg_mbs[i][0]
+        max_seq_len = max(input_ids_mbs[i][0].size(1) for i in range(len(input_ids_mbs)))
+        original_seq_lens = [input_ids_mbs[i][0].size(1) for i in range(len(input_ids_mbs))]
+        for i in range(len(input_ids_mbs)):
+            input_ids = input_ids_mbs[i][0]
             orig_seq_len = input_ids.size(1)
             pad_size = max_seq_len - orig_seq_len
             if pad_size > 0:
                 # Pad input_ids
                 input_ids_padded = torch.nn.functional.pad(input_ids, (0, pad_size), value=0)
-                arg_mbs[i] = (input_ids_padded,)
+                input_ids_mbs[i] = (input_ids_padded,)
 
                 # Pad positions in kwarg_mbs
-                positions = kwarg_mbs[i]["positions"]
+                positions = extra_inputs_mbs[i]["positions"]
                 if positions.dim() == 2:
                     # Shape: [1, seq_len]
                     positions_padded = torch.nn.functional.pad(positions, (0, pad_size), value=0)
                 else:
                     # Shape: [1, num_heads, seq_len] or similar - pad last dim
                     positions_padded = torch.nn.functional.pad(positions, (0, pad_size), value=0)
-                kwarg_mbs[i]["positions"] = positions_padded
+                extra_inputs_mbs[i]["positions"] = positions_padded
 
                 # Update attention masks for padded sequence length
                 # For varlen attention, we need to update VarlenMetadata
-                attention_masks = kwarg_mbs[i].get("attention_masks")
+                attention_masks = extra_kwargs_mbs[i].get("attention_masks")
                 if attention_masks is not None:
                     from torchtitan.models.attention import VarlenMetadata
 
@@ -801,7 +772,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                         cu_seq_k = torch.cat(
                             [cu_seq_k, torch.tensor([max_seq_len], dtype=cu_seq_k.dtype, device=device)]
                         )
-                        kwarg_mbs[i]["attention_masks"] = VarlenMetadata(
+                        extra_kwargs_mbs[i]["attention_masks"] = VarlenMetadata(
                             cu_seq_q=cu_seq_q,
                             cu_seq_k=cu_seq_k,
                             max_q=max_seq_len,  # max could be the padding span now
@@ -813,6 +784,9 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 if target.size(-1) != max_seq_len:
                     target_padded = torch.nn.functional.pad(target, (0, pad_size), value=0)
                     target_mbs[i] = target_padded
+
+        # Convert to final tuple of tuples structure for PP schedule
+        input_ids_mbs = tuple(input_ids_mbs)
 
         # Create PP-compatible loss function wrapper
         # PP schedule calls loss_fn(output, target) where:
@@ -832,7 +806,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 loss: Scalar loss tensor
             """
             mb_idx = current_mb_idx[0]
-            micro_batch = microbatch_data[mb_idx]
+            micro_batch = micro_batches[mb_idx]
             orig_seq_len = original_seq_lens[mb_idx]
             current_mb_idx[0] += 1
 
@@ -871,40 +845,31 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
 
             return loss
 
-        # Set has_backward based on forward_only flag
-        pp_schedule._has_backward = not forward_only
-        # Override loss_fn to use our PP-compatible wrapper
-        pp_schedule._loss_fn = pp_loss_fn
+        # Rebuild PP schedule if n_microbatches changed
+        # The schedule's pipeline_order is computed at init time based on n_microbatches
+        # and cannot be simply overridden. We need to create a new schedule instance.
+        device_name = get_device_name()
+        n_microbatches = len(micro_batches)
+        if self.trainer.pp_schedule._n_microbatches != n_microbatches:
+            schedule_class = get_schedule_class(self.config.parallelism.pipeline_parallel_schedule)
+            stages = self.trainer.pp_schedule._stages
+            # Create new schedule with correct n_microbatches
+            # Note: loss_fn will be overridden below, so pass None here
+            self.trainer.pp_schedule = schedule_class(
+                stages=stages,
+                n_microbatches=n_microbatches,
+                loss_fn=None,
+                scale_grads=False,
+            )
 
-        # Set the same has_backward flag for stage objects
-        # Also reset metadata so shape inference runs again for each batch
-        # This is needed because verl uses dynamic sequence lengths per batch
-        if hasattr(pp_schedule, "_stages"):
-            for stage in pp_schedule._stages:
-                stage.has_backward = pp_schedule._has_backward
-            # Clear runtime states and reset metadata for dynamic shapes
-            for stage in pp_schedule._stages:
-                stage.clear_runtime_states()
-                # Reset output metadata to allow re-inference for different sequence lengths
-                stage._outputs_meta = None
-                # Reset input metadata for dynamic shapes
-                if hasattr(stage, "inputs_meta"):
-                    stage.inputs_meta = None
-            # Reset initialization flags so _prepare_forward_infra runs again
-            # This is needed to trigger shape inference with new batch shapes
-            pp_schedule._stages_forward_initialized = False
-            pp_schedule._stages_backward_initialized = False
-        elif hasattr(pp_schedule, "_stage"):
-            pp_schedule._stage.has_backward = pp_schedule._has_backward
-            pp_schedule._stage.clear_runtime_states()
-            pp_schedule._stage._outputs_meta = None
-            if hasattr(pp_schedule._stage, "inputs_meta"):
-                pp_schedule._stage.inputs_meta = None
-            # Reset initialization flags for single-stage schedule
-            pp_schedule._stage_forward_initialized = False
-            pp_schedule._stage_backward_initialized = False
+        # Set has_backward based on forward_only flag
+        self.trainer.pp_schedule._has_backward = not forward_only
+        # Override loss_fn to use our PP-compatible wrapper
+        self.trainer.pp_schedule._loss_fn = pp_loss_fn
 
         with self.trainer.train_context():
+            targets, losses = (target_mbs, []) if self.trainer.pp_has_last_stage else (None, None)
+
             # Wrap with autocast to ensure bf16 dtype for flash attention compatibility
             with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
                 # Reset microbatch index for loss function
@@ -912,19 +877,22 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
 
                 # Use private _step_microbatches API with pre-split microbatches
                 # For non-first stages, arg_mbs should be None (they receive activations from prev stage)
+                import fbvscode
+
+                fbvscode.set_trace()
                 if self.trainer.pp_has_first_stage:
-                    pp_schedule._step_microbatches(
-                        arg_mbs=arg_mbs,
-                        kwarg_mbs=kwarg_mbs,
-                        target_mbs=target_mbs if self.trainer.pp_has_last_stage else None,
+                    self.trainer.pp_schedule.eval(
+                        input_ids_mbs=input_ids_mbs,
+                        **extra_inputs_mbs,
+                        **extra_kwargs_mbs,
+                        target=target_mbs,
                         losses=losses,
                         return_outputs=False,
                     )
                 else:
-                    pp_schedule._step_microbatches(
-                        arg_mbs=None,
-                        kwarg_mbs=kwarg_mbs,
-                        target_mbs=target_mbs if self.trainer.pp_has_last_stage else None,
+                    self.trainer.pp_schedule.eval(
+                        input_ids_mbs=input_ids_mbs,
+                        **extra_kwargs_mbs,
                         losses=losses,
                         return_outputs=False,
                     )
