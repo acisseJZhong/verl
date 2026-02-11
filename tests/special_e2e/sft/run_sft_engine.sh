@@ -19,7 +19,7 @@ VAL_FILES=${DATASET_DIR}/test.parquet
 
 backend=${BACKEND:-fsdp}
 
-project_name=verl_sft_test
+project_name=verl_sft_test_0210
 
 RESUME_MODE=disable
 
@@ -30,7 +30,7 @@ MODEL_PATH=${MODEL_PATH:-${HOME}/models/${MODEL_ID}}
 #huggingface-cli download "${MODEL_ID}" --local-dir "${MODEL_PATH}"
 
 SP_SIZE=${SP_SIZE:-1}
-FSDP_SIZE=${FSDP_SIZE:-${NUM_GPUS}}
+FSDP_SIZE=${FSDP_SIZE:-1}
 FSDP_STRATEGY=${FSDP_STRATEGY:-"fsdp"}
 
 TP_SIZE=${TP_SIZE:-1}
@@ -46,6 +46,7 @@ FSDP_ENGINE_CONFIG="\
     engine=${backend} \
     model=hf_model \
     model.path=$MODEL_PATH \
+    +model.override_config.attn_implementation=flex_attention \
     optim=${backend} \
     optim.lr=1e-5 \
     optim.lr_warmup_steps_ratio=0.2 \
@@ -54,6 +55,7 @@ FSDP_ENGINE_CONFIG="\
     optim.clip_grad=1.0 \
     optim.min_lr_ratio=0.1 \
     optim.lr_scheduler_type=cosine \
+    optim.total_training_steps=1000 \
     engine.ulysses_sequence_parallel_size=${SP_SIZE} \
     engine.strategy=${FSDP_STRATEGY} \
     engine.fsdp_size=${FSDP_SIZE}"
@@ -96,8 +98,10 @@ MEGATRON_ENGINE_CONFIG="\
 TORCHTITAN_ENGINE_CONFIG="\
     engine=${backend} \
     model=torchtitan_model \
+    model.name=llama3 \
+    model.flavor=8B \
     model.attn_type=varlen \
-    model.hf_assets_path=${MODEL_PATH}
+    model.hf_assets_path=${MODEL_PATH} \
     optim=${backend} \
     optim.lr=1e-5 \
     optim.lr_warmup_steps_ratio=0.2 \
@@ -109,6 +113,10 @@ TORCHTITAN_ENGINE_CONFIG="\
     optim.total_training_steps=1000 \
     engine.tensor_parallel_size=${TP_SIZE} \
     engine.pipeline_parallel_size=${PP_SIZE} \
+    engine.pipeline_parallel_schedule=Interleaved1F1B \
+    engine.pipeline_parallel_layers_per_stage=4 \
+    engine.pipeline_parallel_first_stage_less_layers=0 \
+    engine.pipeline_parallel_last_stage_less_layers=0 \
     engine.context_parallel_size=${CP_SIZE} \
     engine.data_parallel_size=${FSDP_SIZE} \
     engine.use_torch_compile=False"
@@ -148,11 +156,11 @@ $COMMAND \
     ${ENGINE_CONFIG} \
     trainer.test_freq=after_each_epoch \
     trainer.save_freq=-1 \
-    trainer.logger=['console','file'] \
+    trainer.logger=['console','file','wandb'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.total_epochs=2 \
-    trainer.total_training_steps=2 \
+    trainer.total_training_steps=1000 \
     trainer.default_local_dir="${ckpts_home}" \
     trainer.resume_mode=${RESUME_MODE} \
 
