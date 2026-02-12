@@ -283,16 +283,15 @@ class TorchTitanEngine(BaseEngine):
 
         # Compute num_tokens in global batch for loss normalization
         batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
-        dp_group = self.get_data_parallel_group()
-        if dp_group is not None:
-            torch.distributed.all_reduce(batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+        torch.distributed.all_reduce(
+            batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
+        )
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )
-        print(f"jessica: {len(micro_batches)=}")
 
         output_lst = []
 
@@ -305,7 +304,11 @@ class TorchTitanEngine(BaseEngine):
                     loss.backward()
             output_lst.append(output)
 
-        return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+        # Only the rank with outputs (last PP stage, first TP/CP rank) processes results
+        if self.is_mp_src_rank_with_outputs():
+            return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+        else:
+            return {}
 
     def model_forward_step(
         self,
@@ -332,8 +335,6 @@ class TorchTitanEngine(BaseEngine):
                 with self.trainer.maybe_enable_amp:
                     pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
 
-        if not self.config.parallelism.disable_loss_parallel:
-            pred = pred.full_tensor()
         return pred
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
@@ -575,8 +576,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         if use_remove_padding:
             labels = labels.squeeze(0)
             logits_rmpad = logits.squeeze(0)
-            # PyTorch's autograd doesn't allow in-place modification of views when gradients need to flow back
-            logits_rmpad = logits_rmpad / temperature
+            logits_rmpad.div_(temperature)
 
             inplace_backward = True
             if calculate_entropy:
@@ -593,6 +593,23 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 else:
                     entropy_rmpad = torch.utils.checkpoint.checkpoint(self.compute_entropy_from_logits, logits_rmpad)
 
+            # TODO(jessicazhong): how to handle this with TorchTitan SP/TP
+            # if self.use_ulysses_sp:
+            #     pad_size = output_args["pad_size"]
+
+            #     log_probs = gather_outputs_and_unpad(
+            #         log_probs,
+            #         gather_dim=0,
+            #         unpad_dim=0,
+            #         padding_size=pad_size,
+            #     )
+            #     if calculate_entropy:
+            #         entropy_rmpad = gather_outputs_and_unpad(
+            #             entropy_rmpad,
+            #             gather_dim=0,
+            #             unpad_dim=0,
+            #             padding_size=pad_size,
+            #         )
             log_probs = torch.nested.nested_tensor_from_jagged(log_probs.squeeze(0), cu_seqlens)
             if calculate_entropy:
                 entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
@@ -629,21 +646,26 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
             logits = self.model_forward_step(inputs=input_ids, extra_inputs=extra_inputs, extra_kwargs=extra_kwargs)
 
-            model_output = self.prepare_model_outputs(logits=logits, output_args=output_args, micro_batch=micro_batch)
-
-            if loss_function is not None:
-                loss, metrics = loss_function(
-                    model_output=model_output, data=micro_batch, dp_group=self.get_data_parallel_group()
+            if self.is_mp_src_rank_with_outputs():
+                model_output = self.prepare_model_outputs(
+                    logits=logits, output_args=output_args, micro_batch=micro_batch
                 )
+
+                if loss_function is not None:
+                    loss, metrics = loss_function(
+                        model_output=model_output, data=micro_batch, dp_group=self.get_data_parallel_group()
+                    )
+                else:
+                    assert forward_only, "forward_only must be True when loss_function is None"
+                    loss = torch.tensor(1.0, device=device_name)
+                    metrics = {}
+
+                output = {
+                    "model_output": model_output,
+                    "loss": loss.detach().item(),
+                    "metrics": metrics,
+                }
+
+                return loss, output
             else:
-                assert forward_only, "forward_only must be True when loss_function is None"
-                loss = torch.tensor(1.0, device=device_name)
-                metrics = {}
-
-            output = {
-                "model_output": model_output,
-                "loss": loss.detach().item(),
-                "metrics": metrics,
-            }
-
-            return loss, output
+                return None, {}
