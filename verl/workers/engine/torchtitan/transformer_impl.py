@@ -25,6 +25,7 @@ from typing import Any, Callable, Optional
 import torch
 import torch.distributed
 from tensordict import TensorDict
+from torch.distributed.pipelining.schedules import get_schedule_class
 from torchtitan.config.job_config import Checkpoint, Compile, JobConfig, LRScheduler, Model, Optimizer, Parallelism
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
@@ -142,6 +143,10 @@ class TorchTitanEngine(BaseEngine):
             fsdp_reshard_after_forward=self.engine_config.reshard_after_forward,
             tensor_parallel_degree=self.engine_config.tensor_parallel_size,
             pipeline_parallel_degree=self.engine_config.pipeline_parallel_size,
+            pipeline_parallel_schedule=self.engine_config.pipeline_parallel_schedule,
+            pipeline_parallel_layers_per_stage=self.engine_config.pipeline_parallel_layers_per_stage,
+            pipeline_parallel_first_stage_less_layers=self.engine_config.pipeline_parallel_first_stage_less_layers,
+            pipeline_parallel_last_stage_less_layers=self.engine_config.pipeline_parallel_last_stage_less_layers,
             context_parallel_degree=self.engine_config.context_parallel_size,
             expert_parallel_degree=self.engine_config.expert_parallel_size,
             expert_tensor_parallel_degree=self.engine_config.expert_tensor_parallel_size,
@@ -288,54 +293,59 @@ class TorchTitanEngine(BaseEngine):
         )
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
-
-        micro_batches, indices = prepare_micro_batches(
-            data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
-        )
-
+        ctx = torch.no_grad() if forward_only else nullcontext()
         output_lst = []
 
-        ctx = torch.no_grad() if forward_only else nullcontext()
+        if self.parallel_dims.pp_enabled:
+            num_batches_divided_by = None
+            if self.engine_config.pipeline_parallel_layers_per_stage is not None:
+                num_stages = self.trainer.model_args.n_layers // self.engine_config.pipeline_parallel_layers_per_stage
+                vpp_size = num_stages // self.parallel_dims.pp
+                if vpp_size > 1:
+                    # todo(jessicazhong): double check if this correctly maps with megatron PP
+                    num_batches_divided_by = num_stages
 
-        for micro_batch in micro_batches:
-            with ctx:
-                loss, output = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
-                if not forward_only:
-                    loss.backward()
+            micro_batches, indices = prepare_micro_batches(
+                data=data,
+                dp_group=self.get_data_parallel_group(),
+                num_batches_divided_by=num_batches_divided_by,
+                same_micro_num_in_dp=True,
+                min_num_micro_batch=None,
+            )
+
+            if num_batches_divided_by is not None:
+                assert len(micro_batches) % num_batches_divided_by == 0, (
+                    f"micro_batches {micro_batches} must be divisible by num_batches_divided_by "
+                    f"{num_batches_divided_by} for for interleaved PP schedule."
+                )
+
+            # compute input shapes for pp stages
+            n_micro_batch = len(micro_batches)
+            for micro_batch in micro_batches:
+                tu.assign_non_tensor(micro_batch, num_micro_batch=n_micro_batch)
+
+            loss, output = self.forward_step(micro_batches, loss_function=loss_function, forward_only=forward_only)
             output_lst.append(output)
+        else:
+            micro_batches, indices = prepare_micro_batches(
+                data=data,
+                dp_group=self.get_data_parallel_group(),
+                same_micro_num_in_dp=True,
+            )
+            for micro_batch in micro_batches:
+                with ctx:
+                    loss, output = self.forward_step(
+                        micro_batch, loss_function=loss_function, forward_only=forward_only
+                    )
+                    if not forward_only:
+                        loss.backward()
+                output_lst.append(output)
 
         # Only the rank with outputs (last PP stage, first TP/CP rank) processes results
         if self.is_mp_src_rank_with_outputs():
             return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
         else:
             return {}
-
-    def model_forward_step(
-        self,
-        *,
-        inputs: torch.Tensor,
-        extra_inputs: dict[str, torch.Tensor] | None = None,
-        extra_kwargs: dict[str, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-        """
-        Perform a forward pass through the trainer model without backward.
-        """
-        model_parts = self.module
-        parallel_dims = self.parallel_dims
-
-        if parallel_dims.pp_enabled:
-            raise NotImplementedError(
-                "Pipeline parallelism is not yet supported in model_forward_step. "
-                "This will be implemented in a follow-up PR."
-            )
-        else:
-            # Non-PP forward
-            assert len(model_parts) == 1
-            with self.trainer.train_context():
-                with self.trainer.maybe_enable_amp:
-                    pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
-
-        return pred
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         raise NotImplementedError("forward_step must be implemented in subclass")
@@ -638,13 +648,30 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
 
         return model_output
 
-    def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
+    def forward_step(self, micro_batch: TensorDict | list[TensorDict], loss_function, forward_only):
+        """Forward step that handles both single TensorDict and list of TensorDicts.
+
+        For PP, a list of microbatches is passed and processed together by the PP schedule.
+        For non-PP, a single microbatch is processed.
+        """
+        # Handle list of microbatches (PP case)
+        if isinstance(micro_batch, list):
+            return self._forward_step_pp(micro_batch, loss_function, forward_only)
+        else:
+            # Single microbatch case (non-PP)
+            return self._forward_step(micro_batch, loss_function, forward_only)
+
+    def _forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
+        """Forward step for a single microbatch (non-PP case)."""
         device_name = get_device_name()
         micro_batch = micro_batch.to(get_device_id())
         input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
         with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
-            logits = self.model_forward_step(inputs=input_ids, extra_inputs=extra_inputs, extra_kwargs=extra_kwargs)
+            assert len(self.module) == 1
+            with self.trainer.train_context():
+                with self.trainer.maybe_enable_amp:
+                    logits = self.module[0](input_ids, **extra_inputs, **extra_kwargs)
 
             if self.is_mp_src_rank_with_outputs():
                 model_output = self.prepare_model_outputs(
@@ -669,3 +696,233 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 return loss, output
             else:
                 return None, {}
+
+    def _forward_step_pp(self, micro_batches: list[TensorDict], loss_function, forward_only):
+        """Forward step for PP case with list of microbatches.
+
+        Uses the private _step_microbatches API to pass pre-split microbatches directly
+        to the PP schedule, avoiding the split-then-merge overhead.
+
+        Key adaptations for verl:
+        1. Creates a PP-compatible loss function that computes log_probs from logits
+           and uses verl's loss function signature
+        2. Stores microbatch data for use in the loss function wrapper
+        3. Rebuilds the PP schedule when n_microbatches changes to recompute pipeline_order
+        """
+        # Prepare inputs for all microbatches
+        input_ids_mbs = []  # List of input_ids tensors: [input_ids_0, input_ids_1, ...]
+        extra_inputs_mbs = []  # List of dicts: [{positions: ...}, ...]
+        extra_kwargs_mbs = []  # List of dicts: [{attention_masks: ...}, ...]
+        target_mbs = []  # List of labels tensors
+
+        for micro_batch in micro_batches:
+            micro_batch = micro_batch.to(get_device_id())
+            input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
+
+            # input_ids_mbs is a list of tensors: [input_ids_0, input_ids_1, ...]
+            input_ids_mbs.append(input_ids)
+            extra_inputs_mbs.append(extra_inputs)
+            extra_kwargs_mbs.append(extra_kwargs)
+            target_mbs.append(output_args["labels"])
+
+        # Pad inputs to max_seq_len across all microbatches for consistent shapes in PP
+        # This is critical for PP because shape inference happens once and all microbatches
+        # must have consistent shapes for send/receive buffers
+        max_seq_len = max(input_ids_mbs[i].size(1) for i in range(len(input_ids_mbs)))
+        original_seq_lens = [input_ids_mbs[i].size(1) for i in range(len(input_ids_mbs))]
+        for i in range(len(input_ids_mbs)):
+            input_ids = input_ids_mbs[i]
+            orig_seq_len = input_ids.size(1)
+            pad_size = max_seq_len - orig_seq_len
+            if pad_size > 0:
+                # Pad input_ids
+                input_ids_padded = torch.nn.functional.pad(input_ids, (0, pad_size), value=0)
+                input_ids_mbs[i] = input_ids_padded
+
+                # Pad positions in kwarg_mbs
+                positions = extra_inputs_mbs[i]["positions"]
+                if positions.dim() == 2:
+                    # Shape: [1, seq_len]
+                    positions_padded = torch.nn.functional.pad(positions, (0, pad_size), value=0)
+                else:
+                    # Shape: [1, num_heads, seq_len] or similar - pad last dim
+                    positions_padded = torch.nn.functional.pad(positions, (0, pad_size), value=0)
+                extra_inputs_mbs[i]["positions"] = positions_padded
+
+                # Update attention masks for padded sequence length
+                # For varlen attention, we need to update VarlenMetadata
+                attention_masks = extra_kwargs_mbs[i].get("attention_masks")
+                if attention_masks is not None:
+                    from torchtitan.models.attention import VarlenMetadata
+
+                    if isinstance(attention_masks, VarlenMetadata):
+                        # For VarlenMetadata, cu_seqlens defines document boundaries
+                        # To pad to max_seq_len, we add the padding tokens as a new "document"
+                        # This ensures the model processes max_seq_len tokens total
+                        # The padded tokens form their own document and won't attend to real tokens
+                        cu_seq_q = attention_masks.cu_seq_q.clone()
+                        cu_seq_k = attention_masks.cu_seq_k.clone()
+                        # Append max_seq_len as the new final boundary (padding document)
+                        device = cu_seq_q.device
+                        cu_seq_q = torch.cat(
+                            [cu_seq_q, torch.tensor([max_seq_len], dtype=cu_seq_q.dtype, device=device)]
+                        )
+                        cu_seq_k = torch.cat(
+                            [cu_seq_k, torch.tensor([max_seq_len], dtype=cu_seq_k.dtype, device=device)]
+                        )
+                        extra_kwargs_mbs[i]["attention_masks"] = VarlenMetadata(
+                            cu_seq_q=cu_seq_q,
+                            cu_seq_k=cu_seq_k,
+                            max_q=max_seq_len,  # max could be the padding span now
+                            max_k=max_seq_len,
+                        )
+
+                # Pad target labels as well to maintain shape consistency
+                target = target_mbs[i]
+                if target.size(-1) != max_seq_len:
+                    target_padded = torch.nn.functional.pad(target, (0, pad_size), value=0)
+                    target_mbs[i] = target_padded
+
+        # Create PP-compatible loss function wrapper
+        # PP schedule calls loss_fn(output, target) where:
+        # - output: model logits tensor
+        # - target: labels tensor from target_mbs
+        # We need to convert this to verl's loss function signature
+        current_mb_idx = [0]  # Use list for closure mutability
+
+        def pp_loss_fn(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+            """PP-compatible loss function that wraps verl's loss function.
+
+            Args:
+                logits: Model output logits [batch, seq_len, vocab_size] - may be padded
+                labels: Target labels tensor - may be padded
+
+            Returns:
+                loss: Scalar loss tensor
+            """
+            mb_idx = current_mb_idx[0]
+            micro_batch = micro_batches[mb_idx]
+            micro_batch = micro_batch.to(logits.device)
+            orig_seq_len = original_seq_lens[mb_idx]
+            current_mb_idx[0] += 1
+
+            # Unpad logits and labels to original sequence length
+            logits = logits[:, :orig_seq_len, :]
+            labels = labels[:, :orig_seq_len]
+
+            # Compute log_probs from logits (similar to prepare_model_outputs)
+            temperature = micro_batch["temperature"]
+            input_ids = micro_batch["input_ids"]
+            cu_seqlens = input_ids.offsets().to(logits.device)
+
+            # Process logits similar to prepare_model_outputs
+            labels_squeezed = labels.squeeze(0) if labels.dim() > 1 else labels
+            logits_rmpad = logits.squeeze(0) if logits.dim() > 2 else logits
+            logits_rmpad = logits_rmpad / temperature
+
+            log_probs = logprobs_from_logits(
+                logits=logits_rmpad,
+                labels=labels_squeezed,
+                inplace_backward=True,
+            )
+            log_probs_nested = torch.nested.nested_tensor_from_jagged(
+                log_probs.squeeze(0) if log_probs.dim() > 1 else log_probs, cu_seqlens
+            )
+
+            model_output = {"log_probs": log_probs_nested}
+
+            # Call verl's loss function
+            if loss_function is not None:
+                loss, _ = loss_function(
+                    model_output=model_output, data=micro_batch, dp_group=self.get_data_parallel_group()
+                )
+            else:
+                loss = torch.tensor(0.0, device=logits.device)
+
+            return loss
+
+        # Rebuild PP schedule if n_microbatches changed
+        # The schedule's pipeline_order is computed at init time based on n_microbatches
+        # and cannot be simply overridden. We need to create a new schedule instance.
+        device_name = get_device_name()
+        n_microbatches = len(micro_batches)
+        if self.trainer.pp_schedule._n_microbatches != n_microbatches:
+            schedule_class = get_schedule_class(self.config.parallelism.pipeline_parallel_schedule)
+            stages = self.trainer.pp_schedule._stages
+            # Create new schedule with correct n_microbatches
+            # Pass pp_loss_fn as loss_fn so _has_backward is set to True
+            self.trainer.pp_schedule = schedule_class(
+                stages=stages,
+                n_microbatches=n_microbatches,
+                loss_fn=pp_loss_fn,
+                scale_grads=False,
+            )
+        else:
+            # Override loss_fn to use our PP-compatible wrapper
+            self.trainer.pp_schedule._loss_fn = pp_loss_fn
+            # Ensure _has_backward is True for training
+            if not forward_only:
+                self.trainer.pp_schedule._has_backward = True
+
+        with self.trainer.train_context():
+            targets, losses = (target_mbs, []) if self.trainer.pp_has_last_stage else (None, None)
+
+            # Wrap with autocast to ensure bf16 dtype for flash attention compatibility
+            with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
+                # Reset microbatch index for loss function
+                current_mb_idx[0] = 0
+
+                # Use step() for training (backward enabled) or eval() for inference (forward only)
+                # arg_mbs format: list of tuples, one per microbatch
+                if self.trainer.pp_has_first_stage:
+                    arg_mbs = [(input_ids,) for input_ids in input_ids_mbs]
+                    if forward_only:
+                        self.trainer.pp_schedule.eval(
+                            arg_mbs,
+                            **extra_inputs,  # TODO(jessicazhong): figure out what should we pass in
+                            **extra_kwargs,  # TODO(jessicazhong): figure out what should we pass in
+                            target=targets,
+                            losses=losses,
+                            return_outputs=True,
+                        )
+                    else:
+                        self.trainer.pp_schedule.step(
+                            arg_mbs,
+                            **extra_inputs,
+                            **extra_kwargs,
+                            target=targets,
+                            losses=losses,
+                        )
+                else:
+                    # Non-first stages don't provide inputs, but need empty tuples matching n_microbatches
+                    arg_mbs = [()] * n_microbatches
+                    if forward_only:
+                        self.trainer.pp_schedule.eval(
+                            arg_mbs,  # TODO(jessicazhong): figure out if we should pass in this input
+                            **extra_kwargs,  # TODO(jessicazhong): figure out what should we pass in
+                            target=targets,
+                            losses=losses,
+                            return_outputs=True,
+                        )
+                    else:
+                        self.trainer.pp_schedule.step(
+                            arg_mbs,
+                            **extra_kwargs,
+                            target=targets,
+                            losses=losses,
+                        )
+
+        if self.is_mp_src_rank_with_outputs():
+            # Aggregate loss from PP schedule
+            total_loss = torch.sum(torch.stack(losses)) if losses else torch.tensor(0.0, device=device_name)
+
+            # For PP, we return aggregated metrics
+            output = {
+                "model_output": {},  # PP doesn't return per-microbatch outputs easily
+                "loss": total_loss.detach().item(),
+                "metrics": {},
+            }
+
+            return total_loss, output
+        else:
+            return None, {}

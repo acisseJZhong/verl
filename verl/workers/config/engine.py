@@ -292,6 +292,13 @@ class TorchtitanEngineConfig(EngineConfig):
         expert_parallel_size (int): Expert parallel size, default 1
         expert_tensor_parallel_size (int): Expert tensor parallel size, default 1
         pipeline_parallel_size (int): Pipeline parallel size, default 1
+        pipeline_parallel_layers_per_stage (Optional[int]): Number of layers per pipeline stage,
+            used for virtual pipeline parallelism. If None, auto-calculated based on schedule.
+        pipeline_parallel_first_stage_less_layers (int): Weight for input modules (tok_embeddings)
+            in layer calculation for first pipeline stage, default 1.
+        pipeline_parallel_last_stage_less_layers (int): Weight for output modules (norm + output)
+            in layer calculation for last pipeline stage, default 1.
+        pipeline_parallel_schedule (str): Pipeline parallel schedule type, default "1F1B".
         context_parallel_size (int): Context parallel size, default 1
         strategy (str): Strategy to use for distributed training, default "torchtitan"
         seed (int): Random seed for reproducibility.
@@ -316,6 +323,10 @@ class TorchtitanEngineConfig(EngineConfig):
     expert_parallel_size: int = 1
     expert_tensor_parallel_size: int = 1
     pipeline_parallel_size: int = 1
+    pipeline_parallel_layers_per_stage: Optional[int] = None
+    pipeline_parallel_first_stage_less_layers: int = 1
+    pipeline_parallel_last_stage_less_layers: int = 1
+    pipeline_parallel_schedule: str = "1F1B"
     context_parallel_size: int = 1
     strategy: str = "torchtitan"
     seed: int = 42

@@ -46,6 +46,18 @@ expert_parallel_size: 1
 # Pipeline parallel size
 pipeline_parallel_size: 1
 
+# Number of layers per pipeline stage
+pipeline_parallel_layers_per_stage: 1
+
+# Weight for input modules in layer calculation for first pipeline stage
+pipeline_parallel_first_stage_less_layers: 1
+
+# Weight for output modules in layer calculation for last pipeline stage
+pipeline_parallel_last_stage_less_layers: 1
+
+# Pipeline parallel schedule type
+pipeline_parallel_schedule: "1F1B"
+
 # Context parallel size
 context_parallel_size: 1
 
