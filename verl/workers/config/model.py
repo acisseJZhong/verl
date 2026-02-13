@@ -69,6 +69,23 @@ class MtpConfig(BaseConfig):
 
 
 @dataclass
+class TorchtitanModelConfig(BaseConfig):
+    """
+    Configuration for Torchtitan backend.
+
+    name: Model name for torchtitan (e.g., "qwen3", "llama3")
+    flavor: Model flavor/size (e.g., "0.6B", "8B")
+    attn_type: Attention type (e.g., "sdpa", "flex", "varlen")
+    attn_mask_type: Attention mask type (e.g., "causal", "block_causal")
+    """
+
+    name: Optional[str] = None
+    flavor: Optional[str] = None
+    attn_type: str = "sdpa"
+    attn_mask_type: str = "causal"
+
+
+@dataclass
 class HFModelConfig(BaseConfig):
     # note that we separate model_path, model_config_path and tokenizer_path in case they are different
     _mutable_fields = {
@@ -140,6 +157,8 @@ class HFModelConfig(BaseConfig):
     architectures: Optional[list[str]] = None
 
     mtp: MtpConfig = field(default_factory=MtpConfig)
+
+    torchtitan: TorchtitanModelConfig = field(default_factory=TorchtitanModelConfig)
 
     def __post_init__(self):
         import_external_libs(self.external_lib)
@@ -220,17 +239,3 @@ class HFModelConfig(BaseConfig):
 
     def get_processor(self):
         return self.processor if self.processor is not None else self.tokenizer
-
-
-@dataclass
-class TorchtitanModelConfig(HFModelConfig):
-    # Torchtitan-specific fields
-    name: str = "qwen3"
-    flavor: str = "0.6B"
-
-    # Model args overrides
-    attn_type: str = "sdpa"  # e.g., "sdpa", "flex", "varlen"
-    attn_mask_type: str = "causal"  # e.g., "causal", "block_causal"
-
-    def __post_init__(self):
-        super().__post_init__()

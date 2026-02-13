@@ -55,7 +55,7 @@ from verl.utils.fsdp_utils import (
 )
 from verl.utils.model import extract_multi_modal_inputs
 from verl.utils.torch_functional import logprobs_from_logits
-from verl.workers.config import TorchtitanEngineConfig, TorchtitanModelConfig, TorchtitanOptimizerConfig
+from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
 from verl.workers.engine.torchtitan.utils import get_attention_masks
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
@@ -77,7 +77,7 @@ class TorchTitanEngine(BaseEngine):
 
     def __init__(
         self,
-        model_config: TorchtitanModelConfig,
+        model_config: HFModelConfig,
         engine_config: TorchtitanEngineConfig,
         optimizer_config: TorchtitanOptimizerConfig,
         checkpoint_config: CheckpointConfig,
@@ -114,17 +114,17 @@ class TorchTitanEngine(BaseEngine):
         train_spec_module.get_train_spec = _get_train_spec_without_dataloader
 
         # Get train_spec and directly override model_args before Trainer init
-        train_spec = train_spec_module.get_train_spec(self.model_config.name)
-        model_args = train_spec.model_args.get(self.model_config.flavor)
+        train_spec = train_spec_module.get_train_spec(self.model_config.torchtitan.name)
+        model_args = train_spec.model_args.get(self.model_config.torchtitan.flavor)
         if model_args is not None:
             if hasattr(model_args, "attn_type"):
-                model_args.attn_type = self.model_config.attn_type
+                model_args.attn_type = self.model_config.torchtitan.attn_type
             if hasattr(model_args, "attn_mask_type"):
-                model_args.attn_mask_type = self.model_config.attn_mask_type
+                model_args.attn_mask_type = self.model_config.torchtitan.attn_mask_type
 
         model = Model(
-            name=self.model_config.name,
-            flavor=self.model_config.flavor,
+            name=self.model_config.torchtitan.name,
+            flavor=self.model_config.torchtitan.flavor,
             hf_assets_path=self.model_config.path,
         )
         optimizer = Optimizer(

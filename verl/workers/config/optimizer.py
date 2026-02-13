@@ -95,6 +95,8 @@ class FSDPOptimizerConfig(OptimizerConfig):
         min_lr_ratio (Optional[float]): Minimum LR ratio for cosine schedule.
         lr_scheduler_type (str): LR scheduler type: "constant" or "cosine".
         num_cycles (float): Number of cosine cycles in LR schedule.
+        zero_indexed_step (bool): Whether the LR schedule uses 0-indexed steps. If True (default),
+            step counting starts at 0. If False, step counting starts at 1.
     """
 
     _mutable_fields = OptimizerConfig._mutable_fields.copy()
@@ -108,6 +110,7 @@ class FSDPOptimizerConfig(OptimizerConfig):
     lr_scheduler_type: str = "constant"
     num_cycles: float = 0.5
     override_optimizer_config: Optional[dict] = None
+    zero_indexed_step: bool = True
 
     def __post_init__(self):
         if self.warmup_style is not None:
