@@ -25,6 +25,7 @@ from typing import Any, Callable, Optional
 import torch
 import torch.distributed
 from tensordict import TensorDict
+from torch.distributed.tensor import DTensor
 from torchtitan.config.job_config import (
     Checkpoint,
     Compile,
@@ -287,9 +288,7 @@ class TorchTitanEngine(BaseEngine):
 
     def get_data_parallel_group(self):
         mesh = self.parallel_dims.get_optional_mesh(["dp_replicate", "fsdp"])
-        if mesh is None:
-            return None
-        return mesh.get_group()
+        return mesh.get_group() if mesh is not None else None
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False):
         """Perform forward and optionally backward pass on a batch."""
@@ -345,7 +344,7 @@ class TorchTitanEngine(BaseEngine):
                 with self.trainer.maybe_enable_amp:
                     pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
 
-        if not self.config.parallelism.disable_loss_parallel:
+        if isinstance(pred, DTensor):
             pred = pred.full_tensor()
         return pred
 
