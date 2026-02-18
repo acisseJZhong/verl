@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv pip show:*)",
+      "Bash(/home/jessicazhong/verl/.venv/bin/python3:*)"
+    ]
+  }
+}

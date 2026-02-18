@@ -128,6 +128,9 @@ class TaskRunner:
         use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
         # use new model engine implementation
+        import fbvscode
+
+        fbvscode.set_trace()
         if use_legacy_worker_impl == "disable":
             from verl.workers.engine_workers import ActorRolloutRefWorker
 
@@ -162,8 +165,13 @@ class TaskRunner:
             actor_rollout_cls = AsyncActorRolloutRefWorker
             ray_worker_group_cls = RayWorkerGroup
 
-        elif config.actor_rollout_ref.actor.strategy == "veomni":
-            raise NotImplementedError("VeOmni does not support legacy worker implementation")
+        elif (
+            config.actor_rollout_ref.actor.strategy == "veomni"
+            or config.actor_rollout_ref.actor.strategy == "torchtitan"
+        ):
+            raise NotImplementedError(
+                f"{config.actor_rollout_ref.actor.strategy} does not support legacy worker implementation"
+            )
 
         else:
             raise NotImplementedError
@@ -191,14 +199,16 @@ class TaskRunner:
             # TODO: switch this to TrainingWorker as well
             from verl.workers.megatron_workers import CriticWorker
 
-        elif config.critic.strategy == "veomni":
+        elif config.critic.strategy == "veomni" or config.critic.strategy == "torchtitan":
             if use_legacy_worker_impl == "disable":
                 from verl.workers.engine_workers import TrainingWorker
 
                 CriticWorker = TrainingWorker
-                print("Using new worker implementation")
+                print("Using new worker implementation for {config.critic.strategy}")
             else:
-                raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
+                raise ValueError(
+                    f"Invalid use_legacy_worker_impl for {config.critic.strategy}: {use_legacy_worker_impl}"
+                )
 
         else:
             raise NotImplementedError
