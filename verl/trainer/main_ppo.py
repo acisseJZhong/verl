@@ -128,9 +128,6 @@ class TaskRunner:
         use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
         # use new model engine implementation
-        import fbvscode
-
-        fbvscode.set_trace()
         if use_legacy_worker_impl == "disable":
             from verl.workers.engine_workers import ActorRolloutRefWorker
 

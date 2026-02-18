@@ -25,19 +25,14 @@ from typing import Any, Callable, Optional
 import torch
 import torch.distributed
 from tensordict import TensorDict
+from torch.distributed.checkpoint.state_dict import get_model_state_dict
 from torch.distributed.tensor import DTensor
-from torchtitan.config.job_config import (
-    Checkpoint,
-    Compile,
-    JobConfig,
-    LRScheduler,
-    Model,
-    Optimizer,
-    Parallelism,
-    Training,
-)
+from torchtitan.config.job_config import (Checkpoint, Compile, JobConfig,
+                                          LRScheduler, Model, Optimizer,
+                                          Parallelism, Training)
 from torchtitan.distributed import utils as dist_utils
-from torchtitan.distributed.context_parallel import prepare_context_parallel_input
+from torchtitan.distributed.context_parallel import \
+    prepare_context_parallel_input
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.train import Trainer
 
@@ -47,23 +42,20 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.device import get_device_id, get_device_name
-from verl.utils.fsdp_utils import (
-    load_fsdp_model_to_gpu,
-    load_fsdp_optimizer,
-    offload_fsdp_model_to_cpu,
-    offload_fsdp_optimizer,
-)
-from verl.utils.model import extract_multi_modal_inputs
+from verl.utils.fsdp_utils import (load_fsdp_model_to_gpu, load_fsdp_optimizer,
+                                   offload_fsdp_model_to_cpu,
+                                   offload_fsdp_optimizer)
+from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
 from verl.utils.torch_functional import logprobs_from_logits
-from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
+from verl.workers.config import (HFModelConfig, TorchtitanEngineConfig,
+                                 TorchtitanOptimizerConfig)
 from verl.workers.engine.torchtitan.utils import (
-    derive_torchtitan_name_and_flavor,
-    enable_fsdp_gradient_division,
-    get_attention_masks,
-)
+    derive_torchtitan_name_and_flavor, enable_fsdp_gradient_division,
+    get_attention_masks)
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
-from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
+from ..utils import (enable_full_determinism, postprocess_batch_func,
+                     prepare_micro_batches)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -168,10 +160,13 @@ class TorchTitanEngine(BaseEngine):
             initial_load_path=model_config.path,
         )
         compile = Compile(enable=self.engine_config.use_torch_compile)
+        training_kwargs = {}
+        if self.engine_config.max_seq_len is not None:
+            training_kwargs["seq_len"] = self.engine_config.max_seq_len
         if self.engine_config.offload_policy or self.engine_config.forward_only:
-            training = Training(enable_cpu_offload=True)
+            training = Training(enable_cpu_offload=True, **training_kwargs)
         else:
-            training = Training()
+            training = Training(**training_kwargs)
 
         # Construct Torchtitan's JobConfig
         self.config = JobConfig(
@@ -481,6 +476,47 @@ class TorchTitanEngine(BaseEngine):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(self.optimizer)
 
+    def get_per_tensor_param(self, **kwargs):
+        for module in self.module:
+            load_fsdp_model_to_gpu(module)
+
+        # Collect state dicts from all model parts
+        params = {}
+        for module in self.module:
+            module_params = get_model_state_dict(module)
+            params.update(module_params)
+
+        if self._is_offload_param:
+            for module in self.module:
+                offload_fsdp_model_to_cpu(module)
+
+        # Convert TorchTitan key names to HuggingFace key names (expected by vLLM)
+        sd_adapter = self.checkpointer.sd_adapter
+        if sd_adapter is not None:
+            params = sd_adapter.to_hf(params)
+
+        # When weight tying is enabled, the sd_adapter skips lm_head.weight during
+        # to_hf() conversion (since it's the same tensor as embed_tokens.weight in
+        # the torchtitan model). But vLLM needs lm_head.weight explicitly, so we
+        # add it back as a reference to embed_tokens.weight.
+        if "model.embed_tokens.weight" in params and "lm_head.weight" not in params:
+            params["lm_head.weight"] = params["model.embed_tokens.weight"]
+
+        logger.warning(f"get_per_tensor_param: syncing {len(params)} keys: {sorted(params.keys())[:5]}...{sorted(params.keys())[-5:]}")
+
+        device = get_device_id()  # used when fsdp2 set cpu_offload_policy
+        # TODO: cast fp32 to bf16 to reduce weight sync overhead, need more fine-grained control, e.g MoE gate
+        per_tensor_param = (
+            (
+                name,
+                param.to(device, non_blocking=True).full_tensor().to(torch.bfloat16, non_blocking=True)
+                if isinstance(param, DTensor)
+                else param,
+            )
+            for name, param in params.items()
+        )
+        # TODO: support Torchtitan PEFT
+        return per_tensor_param, None
 
 class EngineEvalModeCtx(BaseEngineCtx):
     def __init__(self, engine: TorchTitanEngine, **kwargs):
