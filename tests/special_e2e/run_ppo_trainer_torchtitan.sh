@@ -23,6 +23,7 @@ python3 -m verl.trainer.main_ppo \
     data.max_response_length=256  \
     data.seed=42 \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
+    actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.min_lr_factor=1.0 \
     actor_rollout_ref.actor.ppo_mini_batch_size=64 \
@@ -30,6 +31,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.torchtitan.data_parallel_shard_size="${FSDP_SIZE}" \
     actor_rollout_ref.actor.torchtitan.tensor_parallel_size="${TP_SIZE}" \
     actor_rollout_ref.actor.torchtitan.expert_parallel_size="${EP_SIZE}" \
+    actor_rollout_ref.actor.torchtitan.attn_type=varlen \
     actor_rollout_ref.actor.use_torch_compile=False \
     actor_rollout_ref.ref.use_torch_compile=False \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
@@ -40,7 +42,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.enforce_eager=True \
-    actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.n=5 \
     critic.optim.lr=1e-5 \
     critic.model.path="${MODEL_PATH}" \
@@ -53,7 +54,4 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_before_train="${VAL_BEFORE_TRAIN}" \
     trainer.n_gpus_per_node="${NUM_GPUS}" \
     trainer.nnodes=1 \
-    trainer.save_freq=-1 \
-    trainer.test_freq=-1 \
-    trainer.total_epochs=1 \
     trainer.total_training_steps=100 $@

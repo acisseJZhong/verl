@@ -27,12 +27,18 @@ import torch.distributed
 from tensordict import TensorDict
 from torch.distributed.checkpoint.state_dict import get_model_state_dict
 from torch.distributed.tensor import DTensor
-from torchtitan.config.job_config import (Checkpoint, Compile, JobConfig,
-                                          LRScheduler, Model, Optimizer,
-                                          Parallelism, Training)
+from torchtitan.config.job_config import (
+    Checkpoint,
+    Compile,
+    JobConfig,
+    LRScheduler,
+    Model,
+    Optimizer,
+    Parallelism,
+    Training,
+)
 from torchtitan.distributed import utils as dist_utils
-from torchtitan.distributed.context_parallel import \
-    prepare_context_parallel_input
+from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.train import Trainer
 
@@ -42,20 +48,23 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.device import get_device_id, get_device_name
-from verl.utils.fsdp_utils import (load_fsdp_model_to_gpu, load_fsdp_optimizer,
-                                   offload_fsdp_model_to_cpu,
-                                   offload_fsdp_optimizer)
-from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
+from verl.utils.fsdp_utils import (
+    load_fsdp_model_to_gpu,
+    load_fsdp_optimizer,
+    offload_fsdp_model_to_cpu,
+    offload_fsdp_optimizer,
+)
+from verl.utils.model import extract_multi_modal_inputs
 from verl.utils.torch_functional import logprobs_from_logits
-from verl.workers.config import (HFModelConfig, TorchtitanEngineConfig,
-                                 TorchtitanOptimizerConfig)
+from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
 from verl.workers.engine.torchtitan.utils import (
-    derive_torchtitan_name_and_flavor, enable_fsdp_gradient_division,
-    get_attention_masks)
+    derive_torchtitan_name_and_flavor,
+    enable_fsdp_gradient_division,
+    get_attention_masks,
+)
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
-from ..utils import (enable_full_determinism, postprocess_batch_func,
-                     prepare_micro_batches)
+from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -295,7 +304,15 @@ class TorchTitanEngine(BaseEngine):
 
     def get_data_parallel_group(self):
         mesh = self._get_data_parallel_mesh()
-        return mesh.get_group() if mesh is not None else None
+        if mesh is not None:
+            return mesh.get_group()
+        # If world_size == dp_size (e.g. single GPU, or all ranks are DP),
+        # return WORLD so that collective ops in _postprocess_output
+        # (allgather_dict_into_dict, all_reduce) still run and produce the
+        # correct metric aggregation format.
+        if torch.distributed.get_world_size() == self.get_data_parallel_size():
+            return torch.distributed.group.WORLD
+        return None
 
     def _get_data_parallel_mesh(self):
         """Get the data parallel mesh, handling hybrid/fully/replicate shard modes."""
@@ -502,8 +519,6 @@ class TorchTitanEngine(BaseEngine):
         if "model.embed_tokens.weight" in params and "lm_head.weight" not in params:
             params["lm_head.weight"] = params["model.embed_tokens.weight"]
 
-        logger.warning(f"get_per_tensor_param: syncing {len(params)} keys: {sorted(params.keys())[:5]}...{sorted(params.keys())[-5:]}")
-
         device = get_device_id()  # used when fsdp2 set cpu_offload_policy
         # TODO: cast fp32 to bf16 to reduce weight sync overhead, need more fine-grained control, e.g MoE gate
         per_tensor_param = (
@@ -517,6 +532,7 @@ class TorchTitanEngine(BaseEngine):
         )
         # TODO: support Torchtitan PEFT
         return per_tensor_param, None
+
 
 class EngineEvalModeCtx(BaseEngineCtx):
     def __init__(self, engine: TorchTitanEngine, **kwargs):

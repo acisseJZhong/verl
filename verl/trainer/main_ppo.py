@@ -201,7 +201,7 @@ class TaskRunner:
                 from verl.workers.engine_workers import TrainingWorker
 
                 CriticWorker = TrainingWorker
-                print("Using new worker implementation for {config.critic.strategy}")
+                print(f"Using new worker implementation for {config.critic.strategy}")
             else:
                 raise ValueError(
                     f"Invalid use_legacy_worker_impl for {config.critic.strategy}: {use_legacy_worker_impl}"
