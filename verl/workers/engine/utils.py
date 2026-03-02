@@ -86,6 +86,9 @@ def prepare_micro_batches(
             min_num_micro_batch=min_num_micro_batch,
             use_dynamic_bsz_balance=use_dynamic_bsz_balance,
         )
+        import fbvscode
+
+        fbvscode.set_trace()
     else:
         total_data_size = len(data)
         micro_batch_size_per_gpu = data["micro_batch_size_per_gpu"]

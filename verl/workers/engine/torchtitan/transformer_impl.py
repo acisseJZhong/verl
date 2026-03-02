@@ -16,6 +16,7 @@ The concrete Engine implementation using PyTorch TorchTitan parallelism (FSDP2 +
 """
 
 import gc
+import importlib
 import logging
 import os
 import re
@@ -27,16 +28,10 @@ import torch.distributed
 from tensordict import TensorDict
 from torch.distributed.checkpoint.state_dict import get_model_state_dict
 from torch.distributed.tensor import DTensor
-from torchtitan.config.job_config import (
-    Checkpoint,
-    Compile,
-    JobConfig,
-    LRScheduler,
-    Model,
-    Optimizer,
-    Parallelism,
-    Training,
-)
+from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.distributed.parallel_dims import ParallelDims
@@ -58,13 +53,17 @@ from verl.utils.model import extract_multi_modal_inputs
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
 from verl.workers.engine.torchtitan.utils import (
+    NoOpDataLoader,
     derive_torchtitan_name_and_flavor,
     enable_fsdp_gradient_division,
     get_attention_masks,
+    pad_microbatch_to_length,
 )
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
 from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
+
+IGNORE_INDEX = -100
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -105,35 +104,19 @@ class TorchTitanEngine(BaseEngine):
         self.optimizer_config = optimizer_config
         self.checkpoint_config = checkpoint_config
 
-        # Disable torchtitan's dataloader since verl has its own data loading
-        # Ideally torchtitan trainer init should not initialize dataloader
-        import torchtitan.protocols.train_spec as train_spec_module
-
-        original_get_train_spec = train_spec_module.get_train_spec
-
-        def _get_train_spec_without_dataloader(model_name):
-            train_spec = original_get_train_spec(model_name)
-            train_spec.build_dataloader_fn = None
-            return train_spec
-
-        train_spec_module.get_train_spec = _get_train_spec_without_dataloader
-
         # Derive torchtitan model name and flavor from HF config
         torchtitan_name, torchtitan_flavor = derive_torchtitan_name_and_flavor(self.model_config.hf_config)
 
-        # Get train_spec and directly override model_args before Trainer init
-        train_spec = train_spec_module.get_train_spec(torchtitan_name)
-        model_args = train_spec.model_args.get(torchtitan_flavor)
-        if model_args is not None:
-            if hasattr(model_args, "attn_type"):
-                model_args.attn_type = self.engine_config.attn_type
+        # Get ModelSpec from model registry
+        model_module = importlib.import_module(f"torchtitan.models.{torchtitan_name}")
+        model_spec = model_module.model_registry(torchtitan_flavor)
 
-        model = Model(
-            name=torchtitan_name,
-            flavor=torchtitan_flavor,
-            hf_assets_path=self.model_config.path,
-        )
-        optimizer = Optimizer(
+        # Override attn_backend on the model config if needed
+        attn_type = self.engine_config.attn_type
+        if hasattr(model_spec.model, "layer") and hasattr(model_spec.model.layer, "attention"):
+            model_spec.model.layer.attention.attn_backend = attn_type
+
+        optimizer = OptimizersContainer.Config(
             name=self.optimizer_config.name,
             lr=self.optimizer_config.lr,
             eps=self.optimizer_config.eps,
@@ -147,12 +130,12 @@ class TorchTitanEngine(BaseEngine):
         if lr_warmup_steps is None or lr_warmup_steps <= 0:
             lr_warmup_steps = int(self.optimizer_config.lr_warmup_steps_ratio * total_steps)
 
-        lr_scheduler = LRScheduler(
+        lr_scheduler = LRSchedulersContainer.Config(
             warmup_steps=lr_warmup_steps,
             decay_type=self.optimizer_config.decay_type,
             min_lr_factor=self.optimizer_config.min_lr_factor,
         )
-        parallelism = Parallelism(
+        parallelism = ParallelismConfig(
             data_parallel_replicate_degree=self.engine_config.data_parallel_replicate_size,
             data_parallel_shard_degree=self.engine_config.data_parallel_shard_size,
             fsdp_reshard_after_forward=self.engine_config.reshard_after_forward,
@@ -162,30 +145,33 @@ class TorchTitanEngine(BaseEngine):
             expert_parallel_degree=self.engine_config.expert_parallel_size,
             expert_tensor_parallel_degree=self.engine_config.expert_tensor_parallel_size,
         )
-        checkpoint = Checkpoint(
+        checkpoint = CheckpointManager.Config(
             enable=True,
             initial_load_in_hf=True,
             initial_load_model_only=True,
             initial_load_path=model_config.path,
         )
-        compile = Compile(enable=self.engine_config.use_torch_compile)
+        compile_config = CompileConfig(enable=self.engine_config.use_torch_compile)
         training_kwargs = {}
         if self.engine_config.max_seq_len is not None:
             training_kwargs["seq_len"] = self.engine_config.max_seq_len
         if self.engine_config.offload_policy or self.engine_config.forward_only:
-            training = Training(enable_cpu_offload=True, **training_kwargs)
+            training = TrainingConfig(enable_cpu_offload=True, **training_kwargs)
         else:
-            training = Training(**training_kwargs)
+            training = TrainingConfig(**training_kwargs)
 
-        # Construct Torchtitan's JobConfig
-        self.config = JobConfig(
-            model=model,
+        # Construct Torchtitan's Trainer.Config
+        self.config = Trainer.Config(
+            model_spec=model_spec,
+            hf_assets_path=self.model_config.path,
             optimizer=optimizer,
             lr_scheduler=lr_scheduler,
             parallelism=parallelism,
             checkpoint=checkpoint,
-            compile=compile,
+            compile=compile_config,
             training=training,
+            # Use a no-op dataloader since verl has its own data loading
+            dataloader=NoOpDataLoader.Config(),
         )
         self.trainer = Trainer(self.config)
 
@@ -335,12 +321,20 @@ class TorchTitanEngine(BaseEngine):
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
+        if self.parallel_dims.pp_enabled:
+            return self._forward_backward_batch_pp(data, loss_function, forward_only)
+        else:
+            return self._forward_backward_batch_no_pp(data, loss_function, forward_only)
+
+    def _forward_backward_batch_no_pp(self, data: TensorDict, loss_function: Callable, forward_only=False):
+        """Non-PP path: loop over micro-batches with individual forward/backward."""
         micro_batches, indices = prepare_micro_batches(
-            data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
+            data=data,
+            dp_group=self.get_data_parallel_group(),
+            same_micro_num_in_dp=True,
         )
 
         output_lst = []
-
         ctx = torch.no_grad() if forward_only else nullcontext()
 
         for micro_batch in micro_batches:
@@ -352,6 +346,280 @@ class TorchTitanEngine(BaseEngine):
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
+    def _forward_backward_batch_pp(self, data: TensorDict, loss_function: Callable, forward_only=False):
+        """PP path: pad micro-batches to uniform length and use pp_schedule.step()."""
+        # Step 1: Create micro-batches (at least pp_degree for pipeline filling)
+        micro_batches, indices = prepare_micro_batches(
+            data=data,
+            dp_group=self.get_data_parallel_group(),
+            same_micro_num_in_dp=True,
+            min_num_micro_batch=self.parallel_dims.pp,
+        )
+        n_microbatches = len(micro_batches)
+
+        # Step 2: Find max sequence length across all micro-batches and sync across DP
+        local_max_seq_len = max(mb["input_ids"].shape[-1] for mb in micro_batches)
+        max_seq_len_tensor = torch.tensor([local_max_seq_len], device=get_device_id())
+        dp_group = self.get_data_parallel_group()
+        if dp_group is not None:
+            torch.distributed.all_reduce(max_seq_len_tensor, op=torch.distributed.ReduceOp.MAX, group=dp_group)
+        max_seq_len = int(max_seq_len_tensor.item())
+
+        # Step 3: Pad all micro-batches to max_seq_len and stack
+        pad_token_id = tu.get_non_tensor_data(data=data, key="pad_token_id", default=0)
+        padded_input_ids_list = []
+        padded_position_ids_list = []
+        padded_attention_mask_list = []
+
+        for mb in micro_batches:
+            mb = mb.to(get_device_id())
+            input_ids, position_ids, attention_mask = pad_microbatch_to_length(
+                mb, max_seq_len, pad_token_id=pad_token_id
+            )
+            padded_input_ids_list.append(input_ids)
+            padded_position_ids_list.append(position_ids)
+            padded_attention_mask_list.append(attention_mask)
+
+        # Shape: [n_microbatches, max_seq_len]
+        global_input_ids = torch.cat(padded_input_ids_list, dim=0)
+        global_position_ids = torch.cat(padded_position_ids_list, dim=0)
+        # global_attention_mask = torch.cat(padded_attention_mask_list, dim=0)
+
+        # Step 4: Build labels (shifted input_ids)
+        global_labels = torch.roll(global_input_ids, shifts=-1, dims=1)
+
+        # Step 5: Build attention masks in the format torchtitan expects
+        attn_type = self.trainer.model_config.layer.attention.attn_backend
+        attention_masks = get_attention_masks(
+            input_batch=global_input_ids,
+            positions=global_position_ids,
+            attn_type=attn_type,
+        )
+
+        # Step 6: Handle context parallel if enabled
+        extra_kwargs: dict[str, Any] = {"attention_masks": attention_masks}
+        if self.parallel_dims.cp_enabled:
+            global_input_ids, global_labels, extra_kwargs = prepare_context_parallel_input(
+                global_input_ids,
+                global_labels,
+                extra_kwargs,
+                self.parallel_dims.get_mesh("cp"),
+                self.trainer.device,
+                self.trainer.config.parallelism.context_parallel_load_balancer,
+            )
+
+        # Step 7: Set up the wrapper loss function and run pp_schedule.step()
+        pp_schedule = self.trainer.pp_schedule
+        pp_has_first_stage = self.trainer.pp_has_first_stage
+        pp_has_last_stage = self.trainer.pp_has_last_stage
+
+        # Update n_microbatches on the schedule to match our batch
+        pp_schedule._n_microbatches = n_microbatches
+
+        if forward_only and loss_function is None:
+            # Forward-only without loss: use return_outputs=True to get logits
+            pp_schedule._loss_fn = None
+            pp_schedule._has_backward = False
+
+            with torch.no_grad():
+                with self.trainer.train_context():
+                    if pp_has_first_stage:
+                        merged_logits = pp_schedule.step(
+                            global_input_ids,
+                            positions=global_position_ids,
+                            attention_masks=extra_kwargs["attention_masks"],
+                            target=None,
+                            losses=None,
+                            return_outputs=True,
+                        )
+                    else:
+                        merged_logits = pp_schedule.step(
+                            attention_masks=extra_kwargs["attention_masks"],
+                            target=None,
+                            losses=None,
+                            return_outputs=True,
+                        )
+
+            if pp_has_last_stage and merged_logits is not None:
+                # Process merged logits back into per-microbatch model outputs
+                # merged_logits: [n_microbatches, max_seq_len, vocab_size]
+                micro_batches_on_device = [mb.to(get_device_id()) for mb in micro_batches]
+                logits_chunks = torch.tensor_split(merged_logits, n_microbatches, dim=0)
+                labels_chunks = torch.tensor_split(global_labels, n_microbatches, dim=0)
+
+                output_lst = []
+                for i, (logits_mb, labels_mb) in enumerate(zip(logits_chunks, labels_chunks, strict=False)):
+                    mb_data = micro_batches_on_device[i]
+                    cu_seqlens = mb_data["input_ids"].offsets()
+                    temperature = mb_data["temperature"]
+                    calculate_entropy = tu.get_non_tensor_data(data=mb_data, key="calculate_entropy", default=False)
+                    seq_lengths = cu_seqlens.diff()
+
+                    # Remove padding
+                    valid_logits = []
+                    valid_labels = []
+                    for j, length in enumerate(seq_lengths):
+                        valid_logits.append(logits_mb[j, :length])
+                        valid_labels.append(labels_mb[j, :length])
+                    logits_rmpad = torch.cat(valid_logits, dim=0)
+                    labels_rmpad = torch.cat(valid_labels, dim=0)
+
+                    logits_rmpad = logits_rmpad / temperature
+                    log_probs = logprobs_from_logits(logits=logits_rmpad, labels=labels_rmpad, inplace_backward=True)
+                    log_probs_nested = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
+
+                    model_output = {"log_probs": log_probs_nested}
+                    if calculate_entropy:
+                        entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)
+                        model_output["entropy"] = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
+
+                    output_lst.append(
+                        {
+                            "model_output": model_output,
+                            "loss": 0.0,
+                            "metrics": {},
+                        }
+                    )
+                return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+            else:
+                return {
+                    "model_output": {},
+                    "loss": [-1.0],
+                    "metrics": {},
+                }
+        else:
+            # Training or forward-only with loss: use wrapper loss_fn
+            # The wrapper converts logits -> log_probs/entropy -> verl loss
+            # and captures metrics as a side-effect.
+            captured_metrics = []
+            captured_model_outputs = []
+            mb_counter = [0]
+
+            # Pre-split the micro-batch data for the wrapper to access
+            micro_batches_on_device = [mb.to(get_device_id()) for mb in micro_batches]
+
+            def _pp_wrapper_loss_fn(pred, labels):
+                """Wrapper that adapts verl's loss_function to PP schedule's loss_fn(pred, labels) signature.
+
+                This is called once per micro-batch by the PP schedule, only on the last stage.
+                pred: [microbatch_size, seq_len, vocab_size] -- raw logits
+                labels: [microbatch_size, seq_len] -- shifted input_ids
+                """
+                mb_idx = mb_counter[0]
+                mb_counter[0] += 1
+                mb_data = micro_batches_on_device[mb_idx]
+
+                # Get per-microbatch cu_seqlens from the nested input_ids
+                cu_seqlens = mb_data["input_ids"].offsets()
+                temperature = mb_data["temperature"]
+                calculate_entropy = tu.get_non_tensor_data(data=mb_data, key="calculate_entropy", default=False)
+
+                # Remove padding: extract only valid tokens using cu_seqlens
+                seq_lengths = cu_seqlens.diff()
+                # total_tokens = seq_lengths.sum().item()
+
+                # Gather valid tokens from each sample in the padded micro-batch
+                valid_logits_list = []
+                valid_labels_list = []
+                for i, length in enumerate(seq_lengths):
+                    valid_logits_list.append(pred[i, :length])
+                    valid_labels_list.append(labels[i, :length])
+                logits_rmpad = torch.cat(valid_logits_list, dim=0)  # [total_tokens, vocab]
+                labels_rmpad = torch.cat(valid_labels_list, dim=0)  # [total_tokens]
+
+                # Temperature scaling
+                logits_rmpad = logits_rmpad / temperature
+
+                # Compute log_probs
+                inplace_backward = not calculate_entropy
+                log_probs = logprobs_from_logits(
+                    logits=logits_rmpad,
+                    labels=labels_rmpad,
+                    inplace_backward=inplace_backward,
+                )
+
+                # Compute entropy if needed
+                entropy = None
+                if calculate_entropy:
+                    if not self.engine_config.entropy_checkpointing:
+                        entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)
+                    else:
+                        entropy_rmpad = torch.utils.checkpoint.checkpoint(
+                            self.compute_entropy_from_logits, logits_rmpad
+                        )
+                    entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
+
+                # Re-form nested tensors
+                log_probs_nested = torch.nested.nested_tensor_from_jagged(
+                    log_probs.squeeze(0) if log_probs.dim() > 1 and log_probs.shape[0] == 1 else log_probs,
+                    cu_seqlens,
+                )
+
+                model_output = {"log_probs": log_probs_nested}
+                if entropy is not None:
+                    model_output["entropy"] = entropy
+
+                # Call verl's loss function
+                if loss_function is not None:
+                    loss, metrics = loss_function(
+                        model_output=model_output, data=mb_data, dp_group=self.get_data_parallel_group()
+                    )
+                else:
+                    loss = torch.tensor(0.0, device=pred.device)
+                    metrics = {}
+
+                captured_metrics.append(metrics)
+                captured_model_outputs.append(model_output)
+
+                return loss
+
+            # Set wrapper loss_fn on the schedule
+            pp_schedule._loss_fn = _pp_wrapper_loss_fn
+            pp_schedule._has_backward = not forward_only
+
+            ctx = torch.no_grad() if forward_only else nullcontext()
+            with ctx:
+                with self.trainer.train_context():
+                    targets, losses = (global_labels, []) if pp_has_last_stage else (None, None)
+                    if pp_has_first_stage:
+                        pp_schedule.step(
+                            global_input_ids,
+                            positions=global_position_ids,
+                            attention_masks=extra_kwargs["attention_masks"],
+                            target=targets,
+                            losses=losses,
+                            return_outputs=False,
+                        )
+                    else:
+                        pp_schedule.step(
+                            attention_masks=extra_kwargs["attention_masks"],
+                            target=targets,
+                            losses=losses,
+                            return_outputs=False,
+                        )
+
+            # Build output dict
+            if pp_has_last_stage:
+                # Aggregate losses and metrics from all micro-batches
+                # total_loss = sum(l.detach().item() for l in losses) / n_microbatches
+                output_lst = []
+                for i in range(n_microbatches):
+                    output_lst.append(
+                        {
+                            "model_output": captured_model_outputs[i] if i < len(captured_model_outputs) else {},
+                            "loss": losses[i].detach().item() if i < len(losses) else 0.0,
+                            "metrics": captured_metrics[i] if i < len(captured_metrics) else {},
+                        }
+                    )
+                return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+            else:
+                # Non-last PP stages: return placeholder output
+                return {
+                    "model_output": {},
+                    "loss": [-1.0],
+                    "metrics": {},
+                }
+
     def model_forward_step(
         self,
         *,
@@ -361,15 +629,42 @@ class TorchTitanEngine(BaseEngine):
     ) -> torch.Tensor:
         """
         Perform a forward pass through the trainer model without backward.
+
+        For PP, uses pp_schedule.step() with loss_fn=None and return_outputs=True.
+        Only the last PP stage returns logits; other stages return None.
         """
         model_parts = self.module
         parallel_dims = self.parallel_dims
 
         if parallel_dims.pp_enabled:
-            raise NotImplementedError(
-                "Pipeline parallelism is not yet supported in model_forward_step. "
-                "This will be implemented in a follow-up PR."
-            )
+            pp_schedule = self.trainer.pp_schedule
+            pp_has_first_stage = self.trainer.pp_has_first_stage
+
+            # Configure for forward-only
+            pp_schedule._loss_fn = None
+            pp_schedule._has_backward = False
+
+            with self.trainer.train_context():
+                if pp_has_first_stage:
+                    pred = pp_schedule.step(
+                        inputs,
+                        **extra_inputs,
+                        **extra_kwargs,
+                        target=None,
+                        losses=None,
+                        return_outputs=True,
+                    )
+                else:
+                    pred = pp_schedule.step(
+                        **extra_kwargs,
+                        target=None,
+                        losses=None,
+                        return_outputs=True,
+                    )
+
+            if pred is None:
+                # Non-last PP stage: no outputs
+                return None
         else:
             # Non-PP forward
             assert len(model_parts) == 1
@@ -593,7 +888,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 position_ids = position_ids.values().unsqueeze(0)
 
             labels = torch.roll(input_ids, shifts=-1, dims=1)
-            attn_type = self.trainer.model_args.attn_type
+            attn_type = self.trainer.model_config.layer.attention.attn_backend
             attention_mask = get_attention_masks(
                 input_batch=input_ids,
                 positions=position_ids,
@@ -639,7 +934,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 extra_kwargs,
                 self.parallel_dims.get_mesh("cp"),
                 self.trainer.device,
-                self.trainer.job_config.parallelism.context_parallel_load_balancer,
+                self.trainer.config.parallelism.context_parallel_load_balancer,
             )
 
         # TODO(jessicazhong): multimodal is not yet supported for Torchtitan engine
