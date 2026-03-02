@@ -32,8 +32,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.torchtitan.tensor_parallel_size="${TP_SIZE}" \
     actor_rollout_ref.actor.torchtitan.expert_parallel_size="${EP_SIZE}" \
     actor_rollout_ref.actor.torchtitan.attn_type=flex \
-    actor_rollout_ref.actor.use_torch_compile=False \
-    actor_rollout_ref.ref.use_torch_compile=False \
+    actor_rollout_ref.actor.torchtitan.use_torch_compile=False \
+    actor_rollout_ref.actor.torchtitan.param_offload=False \
+    actor_rollout_ref.actor.torchtitan.optimizer_offload=False \
+    actor_rollout_ref.ref.torchtitan.use_torch_compile=False \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
