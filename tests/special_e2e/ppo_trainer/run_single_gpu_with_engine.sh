@@ -1,12 +1,11 @@
 set -xeuo pipefail
 
-# Test 2: Multi-GPU torchtitan with Qwen3-30B-A3B (MoE), FSDP8 EP8
+# Test 2: Multi-GPU FSDP2 with Qwen3-30B-A3B (MoE), FSDP8
 QWEN30B_MODEL_ID=Qwen/Qwen3-30B-A3B
 QWEN30B_MODEL_PATH=${HOME}/models/${QWEN30B_MODEL_ID}
 
 GRPC_ENABLE_FORK_SUPPORT=0 NCCL_NVLS_ENABLE=0 \
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
-  model_engine=torchtitan \
   algorithm.adv_estimator=grpo \
   data.train_files=$HOME/data/gsm8k/train.parquet \
   data.val_files=$HOME/data/gsm8k/test.parquet \
@@ -17,18 +16,15 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.model.path="${QWEN30B_MODEL_PATH}" \
   actor_rollout_ref.model.use_remove_padding=True \
   actor_rollout_ref.actor.optim.lr=1e-6 \
-  actor_rollout_ref.actor.optim.min_lr_factor=1.0 \
+  actor_rollout_ref.actor.optim.zero_indexed_step=False \
+  +actor_rollout_ref.model.override_config.attn_implementation=sdpa \
   actor_rollout_ref.actor.ppo_mini_batch_size=8 \
+  actor_rollout_ref.actor.strategy=fsdp2 \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1  \
-  actor_rollout_ref.actor.torchtitan.data_parallel_shard_size=8 \
-  actor_rollout_ref.actor.torchtitan.tensor_parallel_size=1 \
-  actor_rollout_ref.actor.torchtitan.expert_parallel_size=8 \
-  actor_rollout_ref.actor.torchtitan.context_parallel_size=1 \
-  actor_rollout_ref.actor.torchtitan.attn_type=flex \
-  actor_rollout_ref.actor.torchtitan.use_torch_compile=False \
-  actor_rollout_ref.actor.torchtitan.param_offload=True \
-  actor_rollout_ref.actor.torchtitan.optimizer_offload=True \
-  actor_rollout_ref.ref.torchtitan.use_torch_compile=False \
+  actor_rollout_ref.actor.fsdp_config.fsdp_size=8 \
+  actor_rollout_ref.actor.fsdp_config.use_torch_compile=False \
+  actor_rollout_ref.actor.fsdp_config.param_offload=True \
+  actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
   actor_rollout_ref.rollout.tensor_model_parallel_size=8 \
@@ -43,7 +39,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
   trainer.use_legacy_worker_impl=disable \
   trainer.logger=['console','file','wandb'] \
   trainer.project_name='verl_grpo_example_gsm8k_0302' \
-  trainer.experiment_name="qwen3-30b-a3b-torchtitan-fsdp8-ep8" \
+  trainer.experiment_name="qwen3-30b-a3b-fsdp2-fsdp8" \
   trainer.n_gpus_per_node=8 \
   trainer.nnodes=1 \
   trainer.total_training_steps=100
