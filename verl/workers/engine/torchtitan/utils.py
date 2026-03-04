@@ -13,6 +13,8 @@
 # limitations under the License.
 import importlib
 import logging
+import re
+from collections import defaultdict
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -261,6 +263,23 @@ def _create_varlen_metadata_for_document(input_batch: torch.Tensor, positions: t
     )
 
 
+# Regex to parse: model.layers.{L}.mlp.experts.{E}.{weight_suffix}
+_EXPERT_PATTERN = re.compile(r"\.layers\.(\d+)\..*\.experts\.(\d+)\.(.*)")
+
+
+def _parse_expert_name(name: str) -> tuple[int, int, str] | None:
+    """Parse layer_id, expert_id, weight_suffix from expert param name."""
+    match = _EXPERT_PATTERN.search(name)
+    if match:
+        return int(match.group(1)), int(match.group(2)), match.group(3)
+    return None
+
+
+def _make_expert_name_template(name: str) -> str:
+    """Convert 'model.layers.0.mlp.experts.3.w1' -> 'model.layers.0.mlp.experts.{}.w1'"""
+    return _EXPERT_PATTERN.sub(lambda m: f".layers.{m.group(1)}.mlp.experts.{{}}.{m.group(3)}", name)
+
+
 def iter_per_tensor_params_ep(
     params: dict[str, Any],
     device: int,
@@ -278,59 +297,24 @@ def iter_per_tensor_params_ep(
     Args:
         params: HF-format state dict with per-expert keys. Expert keys must
             follow the pattern ``model.layers.{L}.mlp.experts.{E}.{suffix}``.
-        device: CUDA device ID to place tensors on.
+        device: device ID to place tensors on.
         ep_group: The EP process group for all-gather.
         ep_size: Number of EP ranks.
     """
-    # Separate expert and non-expert params.
-    # Group expert params by (layer_id, weight_type) for batched all-gather.
-    # (layer_id, weight_suffix) -> {expert_id: (name, param)}
-    expert_params: dict[tuple[int, str], dict[int, tuple[str, Any]]] = {}
+    expert_params: dict[tuple[int, str], dict[int, tuple[str, Any]]] = defaultdict(dict)
     non_expert_params: list[tuple[str, Any]] = []
 
     for name, param in params.items():
-        if "mlp.experts." not in name:
+        parsed = _parse_expert_name(name) if "mlp.experts." in name else None
+        if parsed is None:
             non_expert_params.append((name, param))
-            continue
+        else:
+            layer_id, expert_id, weight_suffix = parsed
+            expert_params[(layer_id, weight_suffix)][expert_id] = (name, param)
 
-        # Parse: model.layers.{L}.mlp.experts.{E}.{weight_type}
-        parts = name.split(".")
-        layer_id = None
-        expert_id = None
-        weight_suffix = None
-        for i, part in enumerate(parts):
-            if part == "layers" and i + 1 < len(parts):
-                try:
-                    layer_id = int(parts[i + 1])
-                except ValueError as err:
-                    raise ValueError(
-                        f"Expected integer layer ID after 'layers.' in '{name}', got '{parts[i + 1]}'"
-                    ) from err
-            elif part == "experts" and i + 1 < len(parts):
-                try:
-                    expert_id = int(parts[i + 1])
-                except ValueError as err:
-                    raise ValueError(
-                        f"Expected integer expert ID after 'experts.' in '{name}', got '{parts[i + 1]}'"
-                    ) from err
-                weight_suffix = ".".join(parts[i + 2 :])
-
-        if layer_id is None or expert_id is None or weight_suffix is None:
-            raise ValueError(
-                f"Failed to parse expert param name '{name}'. "
-                f"Expected format: 'model.layers.{{L}}.mlp.experts.{{E}}.{{weight_type}}' "
-                f"where L and E are integers. "
-                f"Parsed: layer_id={layer_id}, expert_id={expert_id}, weight_suffix={weight_suffix}"
-            )
-        key = (layer_id, weight_suffix)
-        if key not in expert_params:
-            expert_params[key] = {}
-        expert_params[key][expert_id] = (name, param)
-
-    # Release original params dict - all refs are now in expert_params/non_expert_params
     params.clear()
 
-    # Yield non-expert params first, then release them
+    # Yield non-expert params
     for name, param in non_expert_params:
         if isinstance(param, DTensor):
             yield name, param.to(device, non_blocking=True).full_tensor().to(torch.bfloat16, non_blocking=True)
@@ -338,49 +322,30 @@ def iter_per_tensor_params_ep(
             yield name, param
     del non_expert_params
 
-    # Yield expert params: all-gather across EP ranks, one (layer, weight_type) at a time
+    # Yield expert params with all-gather
     for (layer_id, weight_suffix), experts_dict in sorted(expert_params.items()):
-        # Stack local expert weights into a single tensor for all-gather
         sorted_expert_ids = sorted(experts_dict.keys())
+
+        # Stack local expert weights
         local_weights = []
         for eid in sorted_expert_ids:
             _, param = experts_dict[eid]
-            # DTensor case: EP+FSDP — need full_tensor() to resolve FSDP sharding.
             if isinstance(param, DTensor):
                 param = param.to(device, non_blocking=True).full_tensor()
-            # Plain Tensor case: EP only — just move to GPU.
             else:
-                assert isinstance(param, torch.Tensor), (
-                    f"Expected DTensor or Tensor for expert param '{experts_dict[eid][0]}', got {type(param)}"
-                )
                 param = param.to(device, non_blocking=True)
             local_weights.append(param)
 
-        # Build the name template before releasing experts_dict refs
-        name_template = experts_dict[sorted_expert_ids[0]][0]
-        parts = name_template.split(".")
-        for i, part in enumerate(parts):
-            if part == "experts" and i + 1 < len(parts):
-                parts[i + 1] = "{}"
-                break
-        name_template = ".".join(parts)
-
-        # Stack into [num_local_experts, *weight_shape]
+        name_template = _make_expert_name_template(experts_dict[sorted_expert_ids[0]][0])
         local_stacked = torch.stack(local_weights, dim=0)
 
-        # All-gather across EP ranks: each rank contributes num_local_experts
+        # All-gather across EP ranks
         gathered_list = [torch.empty_like(local_stacked) for _ in range(ep_size)]
         torch.distributed.all_gather(gathered_list, local_stacked, group=ep_group)
-
-        # Concatenate: [total_num_experts, *weight_shape]
         all_experts = torch.cat(gathered_list, dim=0)
-        num_total_experts = all_experts.shape[0]
 
-        for expert_id in range(num_total_experts):
-            expert_name = name_template.format(expert_id)
-            # .clone() creates an independent tensor so del all_experts actually frees memory
-            yield expert_name, all_experts[expert_id].to(torch.bfloat16).clone()
+        for expert_id in range(all_experts.shape[0]):
+            yield name_template.format(expert_id), all_experts[expert_id].to(torch.bfloat16).clone()
 
-        # Free memory - safe now since all yielded tensors are clones, not views
         del local_weights, local_stacked, gathered_list, all_experts
         torch.cuda.empty_cache()
