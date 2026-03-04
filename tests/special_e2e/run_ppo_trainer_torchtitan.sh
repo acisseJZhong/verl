@@ -30,7 +30,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.min_lr_factor=1.0 \
     actor_rollout_ref.actor.ppo_mini_batch_size=4 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2  \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1  \
     actor_rollout_ref.actor.torchtitan.data_parallel_shard_size="${FSDP_SIZE}" \
     actor_rollout_ref.actor.torchtitan.tensor_parallel_size="${TP_SIZE}" \
     actor_rollout_ref.actor.torchtitan.expert_parallel_size="${EP_SIZE}" \
@@ -49,7 +49,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.35 \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.enforce_eager=True \
-    actor_rollout_ref.rollout.n=5 \
+    actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.max_model_len="${MAX_SEQ_LEN}" \
     critic.optim.lr=1e-5 \
     critic.model.path="${MODEL_PATH}" \

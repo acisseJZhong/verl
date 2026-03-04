@@ -57,6 +57,7 @@ from verl.workers.engine.torchtitan.utils import (
     derive_torchtitan_name_and_flavor,
     enable_fsdp_gradient_division,
     get_attention_masks,
+    iter_per_tensor_params_ep,
 )
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
@@ -510,149 +511,24 @@ class TorchTitanEngine(BaseEngine):
         # individual expert weights for the locally-owned experts (e.g., 16 out of
         # 128 with EP=8). vLLM needs ALL experts. We gather the missing experts
         # by all-gathering each expert weight across the EP process group.
-        ep_gather_info = None
         if self.parallel_dims.ep_enabled:
-            ep_gather_info = self._build_ep_gather_info(params)
-
-        per_tensor_param = self._iter_per_tensor_params(params, device, ep_gather_info)
+            ep_mesh = self.parallel_dims.get_optional_mesh("ep")
+            ep_group = ep_mesh.get_group()
+            ep_size = self.parallel_dims.ep
+            per_tensor_param = iter_per_tensor_params_ep(params, device, ep_group, ep_size)
+        else:
+            # TODO: cast fp32 to bf16 to reduce weight sync overhead, need more fine-grained control, e.g MoE gate
+            per_tensor_param = (
+                (
+                    name,
+                    param.to(device, non_blocking=True).full_tensor().to(torch.bfloat16, non_blocking=True)
+                    if isinstance(param, DTensor)
+                    else param,
+                )
+                for name, param in params.items()
+            )
         # TODO: support Torchtitan PEFT
         return per_tensor_param, None
-
-    def _build_ep_gather_info(self, params):
-        """Build metadata for gathering expert weights across EP ranks.
-
-        Returns a dict with EP process group and size so we know how to
-        all-gather expert weights.
-        """
-        ep_mesh = self.parallel_dims.get_optional_mesh("ep")
-        if ep_mesh is None:
-            return None
-        ep_group = ep_mesh.get_group()
-        ep_size = self.parallel_dims.ep
-
-        # Verify there are actually expert params to gather
-        has_experts = any("mlp.experts." in name for name in params)
-        if not has_experts:
-            return None
-
-        return {
-            "ep_group": ep_group,
-            "ep_size": ep_size,
-        }
-
-    def _iter_per_tensor_params(self, params, device, ep_gather_info):
-        """Generator that yields (name, tensor) pairs for weight sync.
-
-        When EP is enabled, gathers expert weights across EP ranks one layer
-        at a time to avoid OOM from materializing all experts simultaneously.
-        """
-        if ep_gather_info is None:
-            # No EP: simple path - iterate then clear to release GPU refs
-            param_items = list(params.items())
-            params.clear()  # Release original GPU tensor references
-            for name, param in param_items:
-                if isinstance(param, DTensor):
-                    yield name, param.to(device, non_blocking=True).full_tensor().to(torch.bfloat16, non_blocking=True)
-                else:
-                    yield name, param
-            del param_items
-            return
-
-        # With EP: gather expert weights across EP ranks lazily
-        ep_group = ep_gather_info["ep_group"]
-        ep_size = ep_gather_info["ep_size"]
-
-        # Separate expert and non-expert params
-        # Group expert params by (layer_id, weight_type) for batched all-gather
-        expert_params = {}  # (layer_id, weight_suffix) -> {expert_id: (name, param)}
-        non_expert_params = []
-
-        for name, param in params.items():
-            if "mlp.experts." not in name:
-                non_expert_params.append((name, param))
-                continue
-
-            # Parse: model.layers.{L}.mlp.experts.{E}.{weight_type}
-            parts = name.split(".")
-            layer_id = None
-            expert_id = None
-            weight_suffix = None
-            for i, part in enumerate(parts):
-                if part == "layers" and i + 1 < len(parts):
-                    try:
-                        layer_id = int(parts[i + 1])
-                    except ValueError:
-                        pass
-                elif part == "experts" and i + 1 < len(parts):
-                    try:
-                        expert_id = int(parts[i + 1])
-                        weight_suffix = ".".join(parts[i + 2 :])
-                    except ValueError:
-                        pass
-
-            if layer_id is not None and expert_id is not None and weight_suffix is not None:
-                key = (layer_id, weight_suffix)
-                if key not in expert_params:
-                    expert_params[key] = {}
-                expert_params[key][expert_id] = (name, param)
-            else:
-                non_expert_params.append((name, param))
-
-        # Release original params dict - all refs are now in expert_params/non_expert_params
-        params.clear()
-
-        # Yield non-expert params first, then release them
-        for name, param in non_expert_params:
-            if isinstance(param, DTensor):
-                yield name, param.to(device, non_blocking=True).full_tensor().to(torch.bfloat16, non_blocking=True)
-            else:
-                yield name, param
-        del non_expert_params
-
-        # Yield expert params: all-gather across EP ranks, one (layer, weight_type) at a time
-        for (layer_id, weight_suffix), experts_dict in sorted(expert_params.items()):
-            # Stack local expert weights into a single tensor for all-gather
-            sorted_expert_ids = sorted(experts_dict.keys())
-            local_weights = []
-            for eid in sorted_expert_ids:
-                _, param = experts_dict[eid]
-                if isinstance(param, DTensor):
-                    param = param.to(device, non_blocking=True).full_tensor()
-                elif isinstance(param, torch.Tensor):
-                    param = param.to(device, non_blocking=True)
-                local_weights.append(param)
-
-            # Build the name template before releasing experts_dict refs
-            name_template = experts_dict[sorted_expert_ids[0]][0]
-            parts = name_template.split(".")
-            for i, part in enumerate(parts):
-                if part == "experts" and i + 1 < len(parts):
-                    parts[i + 1] = "{}"
-                    break
-            name_template = ".".join(parts)
-
-            # Release original param references for this group
-            experts_dict.clear()
-
-            # Stack into [num_local_experts, *weight_shape]
-            local_stacked = torch.stack(local_weights, dim=0)
-
-            # All-gather across EP ranks: each rank contributes num_local_experts
-            gathered_list = [torch.empty_like(local_stacked) for _ in range(ep_size)]
-            torch.distributed.all_gather(gathered_list, local_stacked, group=ep_group)
-
-            # Concatenate: [total_num_experts, *weight_shape]
-            all_experts = torch.cat(gathered_list, dim=0)
-            num_total_experts = all_experts.shape[0]
-
-            for expert_id in range(num_total_experts):
-                expert_name = name_template.format(expert_id)
-                # .clone() creates an independent tensor so del all_experts actually frees memory
-                yield expert_name, all_experts[expert_id].to(torch.bfloat16).clone()
-
-            # Free memory - safe now since all yielded tensors are clones, not views
-            del local_weights, local_stacked, gathered_list, all_experts
-            torch.cuda.empty_cache()
 
 
 class EngineEvalModeCtx(BaseEngineCtx):
@@ -847,6 +723,14 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 assert forward_only, "forward_only must be True when loss_function is None"
                 loss = torch.tensor(1.0, device=device_name)
                 metrics = {}
+
+            output = {
+                "model_output": model_output,
+                "loss": loss.detach().item(),
+                "metrics": metrics,
+            }
+
+            return loss, output
 
             output = {
                 "model_output": model_output,
