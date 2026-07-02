@@ -33,6 +33,7 @@ from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed import utils as dist_utils
+from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.train import Trainer
@@ -142,6 +143,7 @@ class TorchTitanEngine(BaseEngine):
             pipeline_parallel_degree=self.engine_config.pipeline_parallel_size,
             context_parallel_degree=self.engine_config.context_parallel_size,
             expert_parallel_degree=self.engine_config.expert_parallel_size,
+            spmd_backend=self.engine_config.spmd_backend,
         )
         checkpoint = CheckpointManager.Config(
             enable=True,
@@ -158,6 +160,17 @@ class TorchTitanEngine(BaseEngine):
         else:
             training = TrainingConfig(**training_kwargs)
 
+        # Activation checkpointing mode. Note: under spmd_backend="spmd_types" with
+        # eager execution (use_torch_compile=False), selective/full AC recompute runs
+        # on the autograd backward thread where the thread-local SPMD mesh is inactive,
+        # so spmd.assert_type() raises "no current mesh". Set activation_checkpoint="none"
+        # (or enable torch.compile, which recomputes in-graph) in that configuration.
+        activation_checkpoint = {
+            "selective": SelectiveAC.Config,
+            "full": FullAC.Config,
+            "none": lambda: None,
+        }[self.engine_config.activation_checkpoint]()
+
         # Construct Torchtitan's Trainer.Config
         self.config = Trainer.Config(
             model_spec=model_spec,
@@ -168,6 +181,7 @@ class TorchTitanEngine(BaseEngine):
             checkpoint=checkpoint,
             compile=compile_config,
             training=training,
+            activation_checkpoint=activation_checkpoint,
             # Use a no-op dataloader since verl has its own data loading
             dataloader=NoOpDataLoader.Config(),
             # Provide a concrete loss so Trainer.__init__ can build it;
