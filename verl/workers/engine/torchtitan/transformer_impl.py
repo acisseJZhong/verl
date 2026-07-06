@@ -351,11 +351,23 @@ class TorchTitanEngine(BaseEngine):
 
         ctx = torch.no_grad() if forward_only else nullcontext()
 
+        # torchtitan's train_context activates the SPMD mesh (set_current_spmd_mesh) that
+        # spmd_types' typed collectives (spmd.assert_type) require. It must span BOTH forward
+        # and backward: under selective activation checkpointing the module forward is re-run
+        # during loss.backward(), and those recomputed assert_type calls need the mesh live.
+        # The mesh is thread-local, so the recompute must run on the thread that entered
+        # train_context. verl drives this step inside a Ray actor on a NON-main thread; with
+        # autograd multithreading enabled, torch runs backward (and the AC recompute) on a
+        # separate autograd worker thread where the thread-local mesh is inactive ->
+        # spmd.assert_type "no current mesh". set_multithreading_enabled(False) forces backward
+        # onto the calling thread so the recompute sees the mesh. Both are no-ops for the
+        # "default"/"full_dtensor" backends and when AC is disabled.
         for micro_batch in micro_batches:
-            with ctx:
+            with self.trainer.train_context(), ctx:
                 loss, output = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
                 if not forward_only:
-                    loss.backward()
+                    with torch.autograd.set_multithreading_enabled(False):
+                        loss.backward()
             output_lst.append(output)
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
@@ -379,10 +391,9 @@ class TorchTitanEngine(BaseEngine):
                 "This will be implemented in a follow-up PR."
             )
         else:
-            # Non-PP forward
+            # Non-PP forward. train_context (SPMD mesh) is set by the caller.
             assert len(model_parts) == 1
-            with self.trainer.train_context():
-                pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
+            pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
 
         if isinstance(pred, DTensor):
             pred = pred.full_tensor()
